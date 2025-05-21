@@ -26,7 +26,7 @@ import torch, torch.nn as nn, torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader, Subset
 import numpy as np
 
-from dataset_loader import CWPowerDataset
+from data_loader import CWPowerDataset
 
 dBm_factor = 10.0 / math.log(10)
 
