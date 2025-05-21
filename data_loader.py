@@ -7,36 +7,32 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 ###############################################################################
-# Dataset that matches the *minimal* .npz produced by the updated builder
-# ----------------------------------------------------------------------
-# Each .npz contains:
-#   x    : complex64 (1000,)           – raw burst, already freq‑shifted
-#   meta : {
-#            'pristine_gain': complex64,
-#            'tone_pwr_dBm' : int,
-#            ...
-#          }
+# CWPowerDataset  – now with optional *undo_shift* flag
 ###############################################################################
 
 class CWPowerDataset(Dataset):
-    """Torch `Dataset` for raw‑burst + pristine‑gain files.
+    """Dataset of raw bursts + pristine gain.
 
-    Args
-    -----
-    root : Path to the tree built by *build_dataset_tree.py*.
-    crop : Number of samples to slice out of each burst.  If `crop == 0`
-           or equals the burst length (1000), the full burst is returned.
-    complex_out : If True, returns complex tensors of shape (N,) instead of
-                  stacked (2, N) real/imag channels.  Useful for complex
-                  convolution layers.
+    Parameters
+    ----------
+    root : Path
+        Root folder produced by *build_dataset_tree.py*.
+    crop : int, optional
+        Random crop length. 0 → use full burst. Default 1000.
+    complex_out : bool, optional
+        Return complex tensor instead of 2‑channel real. Default False.
+    undo_shift : bool, optional
+        If True, multiply every burst by exp(+j2π·offset·n/fs) to *undo* the
+        200 kHz (or any) coarse shift saved in meta. Default False.
     """
 
-    def __init__(self, root: Path, *, crop: int = 1000, complex_out: bool = False):
+    def __init__(self, root: Path, *, crop: int = 1000, complex_out: bool = False, undo_shift: bool = False):
         self.files: List[Path] = sorted(root.rglob("*.npz"))
         if not self.files:
             raise ValueError(f"No .npz files found under {root}")
         self.crop = crop
         self.complex_out = complex_out
+        self.undo_shift = undo_shift
 
     # ----------------------------------------------------------
     def __len__(self) -> int:
@@ -44,51 +40,54 @@ class CWPowerDataset(Dataset):
 
     # ----------------------------------------------------------
     def _random_window(self, x: np.ndarray) -> np.ndarray:
-        """Return a crop‑length slice (wrap if x shorter)."""
         if self.crop == 0 or self.crop >= len(x):
             return x
         start = np.random.randint(0, len(x) - self.crop + 1)
-        return x[start : start + self.crop]
+        return x[start:start + self.crop]
 
     # ----------------------------------------------------------
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         with np.load(self.files[idx], allow_pickle=True) as z:
-            x_raw = z["x"].astype(np.complex64)              # (1000,)
-            meta  = z["meta"].item()
-            g     = meta["pristine_gain"].astype(np.complex64)
+            x = z["x"].astype(np.complex64)            # raw burst
+            meta = z["meta"].item()
+            g = meta["pristine_gain"].astype(np.complex64)
 
-        x_win = self._random_window(x_raw)
+        # optional inverse frequency shift ---------------------------------
+        if self.undo_shift and meta.get("offset_hz", 0) != 0:
+            fs = meta["fs"]
+            f0 = meta["offset_hz"]
+            n = np.arange(len(x), dtype=np.float32)
+            x = x * np.exp(+1j * 2 * np.pi * f0 * n / fs)
 
-        # normalise window RMS → 1  (common in earlier pipeline)
-        #x_win = x_win / np.sqrt(np.mean(np.abs(x_win) ** 2))
+        # random crop -------------------------------------------------------
+        x_win = self._random_window(x)
 
+        # unit‑RMS normalisation -------------------------------------------
         rms = np.sqrt(np.mean(np.abs(x_win)**2))
         x_win /= rms
+        g_norm = g / rms                               # keep label on same scale
 
-        # convert to torch tensor
+        # to tensor ---------------------------------------------------------
         if self.complex_out:
             x_t = torch.view_as_real(torch.from_numpy(x_win)).float()
-            x_t = torch.view_as_complex(x_t)                 # dtype: complex64
+            x_t = torch.view_as_complex(x_t)
         else:
             x_t = torch.from_numpy(np.stack([x_win.real, x_win.imag], 0))
 
-       
-        g = meta["pristine_gain"] / meta["rms_mix"] 
-        target = np.array([ g.real,
-                    g.imag ], np.float32)
+        target = torch.tensor([g_norm.real, g_norm.imag], dtype=torch.float32)
         return x_t, target
 
 ###############################################################################
-# Convenience factory: split train/val by modulo index
+# Helper factory (unchanged except for undo_shift passthrough)
 ###############################################################################
 
-def make_loaders(root: Path, *, batch: int = 256, crop: int = 1000, val_frac=0.1, **dl_kwargs):
+def make_loaders(root: Path, *, batch: int = 256, crop: int = 1000, val_frac=0.1, undo_shift=False, **dl_kwargs):
     files = sorted(root.rglob("*.npz"))
     train_files = [f for i, f in enumerate(files) if (i % int(1/val_frac))]
     val_files   = [f for i, f in enumerate(files) if not (i % int(1/val_frac))]
 
-    ds_train = CWPowerDataset(root, crop=crop)
-    ds_val   = CWPowerDataset(root, crop=crop)
+    ds_train = CWPowerDataset(root, crop=crop, undo_shift=undo_shift)
+    ds_val   = CWPowerDataset(root, crop=crop, undo_shift=undo_shift)
     ds_train.files = train_files
     ds_val.files   = val_files
 
@@ -97,18 +96,17 @@ def make_loaders(root: Path, *, batch: int = 256, crop: int = 1000, val_frac=0.1
     return dl_train, dl_val
 
 ###############################################################################
-# Example usage (run as `python dataset_loader.py /path/to/dataset`)
+# CLI sanity test
 ###############################################################################
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("root", type=Path)
-    parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--crop", type=int, default=1000)
+    parser.add_argument("--undo-shift", action="store_true")
     args = parser.parse_args()
 
-    dl_train, dl_val = make_loaders(args.root, batch=args.batch, crop=args.crop, num_workers=2)
-    x, y = next(iter(dl_train))
-    print("x", x.shape, x.dtype)
-    print("y", y.shape, y.dtype)
+    ds = CWPowerDataset(args.root, crop=args.crop, undo_shift=args.undo_shift)
+    x, y = ds[0]
+    print("x", x.shape, x.dtype, "| target", y)

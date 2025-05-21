@@ -111,6 +111,20 @@ print(f"Evaluating {len(files)} bursts …")
 by_sir = [defaultdict(list) for _ in nets]
 by_sir_fft = defaultdict(list)
 
+# ---------------------------------------------------------------------
+# PSD helper + book-keeping
+# ---------------------------------------------------------------------
+plotted_sir = set()                     # keep track so we plot each SIR once
+
+def db_spectrum(sig: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Hann-window PSD in dB re burst RMS (x is already unit-RMS)."""
+    N   = len(sig)
+    S   = np.fft.fftshift(np.fft.fft(sig*np.hanning(N))) / N
+    f   = np.fft.fftshift(np.fft.fftfreq(N, d=1/10e6)) / 1e6   # MHz
+    P_dB= 20*np.log10(np.abs(S) + 1e-18)                       # avoid log(0)
+    return f, P_dB
+
+
 for f in tqdm(files, unit="file"):
     _, _, sir = parse_levels(f.parent.name)
     with np.load(f, allow_pickle=True) as z:
@@ -146,6 +160,39 @@ for f in tqdm(files, unit="file"):
             else:
                 pred_dBm = out.cpu().item()
             preds.append(pred_dBm)
+    
+        # --------------------------------------------------------------
+    # --- one PSD figure per SIR (mixture · ground-truth · estimate)
+    # --------------------------------------------------------------
+    if sir not in plotted_sir:
+        #  a) mixture (already unit-RMS)
+        f_MHz, P_mix = db_spectrum(x_n)
+
+        #  b) ground-truth CW only
+        y_gt = np.full_like(x_n, g_ref)          # constant CW
+        _,   P_gt  = db_spectrum(y_gt)
+
+        #  c) estimate from *first* model’s power prediction
+        pred_dBm   = preds[0]                    # first model only
+        mag_est    = math.sqrt(1e-3*10**(pred_dBm/10))
+        g_est      = mag_est * np.exp(1j*np.angle(g_ref))
+        y_hat      = np.full_like(x_n, g_est)
+        _,   P_hat = db_spectrum(y_hat)
+
+        fig_psd, ax_psd = plt.subplots(figsize=(6,3))
+        ax_psd.plot(f_MHz, P_mix, label='mixture', lw=.7)
+        ax_psd.plot(f_MHz, P_gt,  label='ground truth')
+        ax_psd.plot(f_MHz, P_hat, label=f'estimate ({labels[0]})', ls='--')
+        ax_psd.set(xlabel='Frequency (MHz)', ylabel='dB re RMS',
+                   title=f'PSD – SIR {sir} dB',
+                   xlim=(-5, 5)); ax_psd.grid(ls=':')
+        ax_psd.set_ylim(-150, 0); ax_psd.legend(frameon=False, ncol=3)
+        fig_psd.tight_layout()
+        fig_psd.savefig(args.outdir / f'psd_SIR{sir}.png', dpi=220)
+        plt.close(fig_psd)
+
+        plotted_sir.add(sir)
+
 
     for m, p in enumerate(preds):
         by_sir[m][sir].append(p - ref_dBm)
