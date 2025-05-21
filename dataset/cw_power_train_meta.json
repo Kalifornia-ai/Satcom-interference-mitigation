@@ -1,7 +1,7 @@
 {
   "seed": 0,
-  "best_val_rmse": 12.717167566382788,
-  "test_rmse": 16.883413628816854,
+  "best_val_rmse": 0.6111301893871041,
+  "test_rmse": 2.772798610250705,
   "test_folders": [
     "Sine_50002-50dBm_QPSK_5G_-10dBm",
     "Sine_50002-45dBm_QPSK_5G_-10dBm",

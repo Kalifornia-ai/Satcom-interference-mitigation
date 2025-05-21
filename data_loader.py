@@ -74,8 +74,8 @@ class CWPowerDataset(Dataset):
 
        
         g = meta["pristine_gain"] / meta["rms_mix"] 
-        target = np.array([ (g / rms).real,
-                    (g / rms).imag ], np.float32)
+        target = np.array([ g.real,
+                    g.imag ], np.float32)
         return x_t, target
 
 ###############################################################################
