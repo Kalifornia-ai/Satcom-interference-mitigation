@@ -2,22 +2,26 @@
 """evaluate_beacon_net_multi.py – compare ≥ 1 checkpoints (scalar‑dB CNN **or**
 sequence‑to‑DC LSTM/TorchScript).
 
+* Reads the **test_idx** list saved in the training JSON (default
+  ``cw_power_train_meta.json``) instead of hard‑coding folder names.
 * Accepts any mix of **state‑dict (.pt)** and **TorchScript (.pth)** files.
 * If a model outputs a **(B,T,2)** complex sequence, we collapse it to a single
-  complex gain with a mean over time and then convert to dBm so it is directly
-  comparable to scalar‑dB models and to the FFT baseline.
+  complex gain and convert to dBm so it is directly comparable to scalar‑dB
+  models and to the FFT baseline.
 * Unknown receptive‑field length can be forced with `--len-override N`.
 
 Example
 -------
+```bash
 python evaluate_beacon_net_multi.py \
        --data   ./dataset \
-       --ckpts  best_beacon_cnn.pt  Deployment_len200_cpu.pth \
+       --ckpts  best_beacon_cnn.pt  deployment_len200_cpu.pth \
+       --meta   cw_power_train_meta.json \
        --outdir eval_multi
-"""
+```"""
 
-import argparse, csv, math, re
 from pathlib import Path
+import argparse, csv, math, json, re
 from collections import defaultdict
 
 import numpy as np
@@ -29,29 +33,32 @@ from scipy.fft import fft
 
 from model import BeaconPowerCNN   # scalar‑dB reference architecture
 
-# ────────────────────────── helpers ─────────────────────────────────────
-FOLDERS = [
-    "Sine_50002-50dBm_QPSK_5G_-10dBm","Sine_50002-45dBm_QPSK_5G_-10dBm",
-    "Sine_50002-40dBm_QPSK_5G_-10dBm","Sine_50002-45dBm_QPSK_5G_-20dBm",
-    "Sine_50002-40dBm_QPSK_5G_-20dBm","Sine_50002-25dBm_QPSK_5G_-10dBm",
-    "Sine_50002-20dBm_QPSK_5G_-10dBm","Sine_50002-25dBm_QPSK_5G_-20dBm",
-    "Sine_50002-20dBm_QPSK_5G_-20dBm","Sine_50002-25dBm_QPSK_5G_-30dBm",
-    "Sine_50002-20dBm_QPSK_5G_-30dBm","Sine_50002-25dBm_QPSK_5G_-40dBm",
-    "Sine_50002-10dBm_QPSK_5G_-30dBm","Sine_50002-25dBm_QPSK_5G_-50dBm",
-    "Sine_50002-10dBm_QPSK_5G_-40dBm","Sine_50002-10dBm_QPSK_5G_-50dBm",
-]
-PAT_CW, PAT_QPSK = re.compile(r"Sine_50002[-_]?(-?\d+)dBm"), re.compile(r"QPSK_5G[-_]?(-?\d+)dBm")
-GAIN = 0.375   # Hann 3‑bin coherent gain
+# ────────────────────────── CLI ─────────────────────────────────────────
+cli = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+cli.add_argument("--data",   required=True, type=Path)
+cli.add_argument("--ckpts",  nargs="+", required=True, type=Path)
+cli.add_argument("--outdir", default="eval_multi", type=Path)
+cli.add_argument("--meta",   default="cw_power_train_meta.json", type=Path,
+                help="JSON file that holds test_idx list")
+cli.add_argument("--len-override", type=int, default=None,
+                help="force input length for ALL models (scripted ones in particular)")
+args = cli.parse_args(); args.outdir.mkdir(parents=True, exist_ok=True)
 
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+cm     = plt.get_cmap("tab10")
+
+dBm_factor = 10.0 / math.log(10)
+GAIN = 0.375
+
+PAT_CW   = re.compile(r"Sine_50002[-_]?(-?\d+)dBm")
+PAT_QPSK = re.compile(r"QPSK_5G[-_]?(-?\d+)dBm")
 parse_levels = lambda name: (
     int(PAT_CW.search(name).group(1)),
     int(PAT_QPSK.search(name).group(1)),
     -int(PAT_QPSK.search(name).group(1)) - int(PAT_CW.search(name).group(1))
 )
 
-dBm_factor = 10.0 / math.log(10)
-
-def gain_to_dBm(g: complex) -> float:  # |g|² reference 1 mW
+def gain_to_dBm(g: complex) -> float:
     return dBm_factor * math.log((abs(g)**2) / 1e-3)
 
 def fft_3bin_amp(x: np.ndarray) -> float:
@@ -59,27 +66,14 @@ def fft_3bin_amp(x: np.ndarray) -> float:
     return np.sqrt(np.sum(np.abs(X[[0, 1, -1]])**2) / GAIN)
 
 def seq_to_gain(out_seq: torch.Tensor) -> torch.Tensor:
-    """Collapse (B,T,2) decoded CW to a single complex gain."""
     re = out_seq[..., 0].mean(dim=1)
     im = out_seq[..., 1].mean(dim=1)
     return torch.complex(re, im)
 
-# ────────────────────────── CLI ─────────────────────────────────────────
-cli = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-cli.add_argument("--data",   required=True, type=Path)
-cli.add_argument("--ckpts",  nargs="+", required=True, type=Path)
-cli.add_argument("--outdir", default="eval_multi", type=Path)
-cli.add_argument("--len-override", type=int, default=None,
-                help="force input length for ALL models (useful for scripted")
-args = cli.parse_args(); args.outdir.mkdir(parents=True, exist_ok=True)
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-cm     = plt.get_cmap("tab10")
-
 # ────────────────────────── load models ────────────────────────────────
 nets, labels, colors, in_len = [], [], [], []
 for i, ck in enumerate(args.ckpts):
-    expected = 1000  # default
+    expected = 1000
     try:
         sd = torch.load(ck, map_location=DEVICE, weights_only=True)
         net = BeaconPowerCNN().to(DEVICE)
@@ -89,7 +83,7 @@ for i, ck in enumerate(args.ckpts):
         plist = list(net.parameters())
         if plist and plist[0].dim() == 3:
             k = plist[0].shape[-1]
-            if k >= 50:  # treat tiny kernels as non‑informative
+            if k >= 50:
                 expected = k
     net.eval(); nets.append(net)
     labels.append(ck.stem); colors.append(cm(i % 10)); in_len.append(expected)
@@ -97,19 +91,33 @@ for i, ck in enumerate(args.ckpts):
 if args.len_override:
     in_len = [args.len_override]*len(in_len)
 
+# ────────────────────────── build test file list via meta JSON ─────────
+meta_path = args.data / args.meta
+if not meta_path.exists():
+    raise SystemExit(f"JSON meta not found: {meta_path}")
+meta = json.loads(meta_path.read_text())
+try:
+    test_idx = np.array(meta["test_idx"], dtype=int)
+except KeyError:
+    raise SystemExit("'test_idx' not found in JSON meta. Re‑train with latest cw_power_model.py.")
+
+# full sorted file list exactly like training loader does
+files_all = np.array(sorted(args.data.rglob("*.npz")))
+files = files_all[test_idx]
+
+print(f"Evaluating {len(files)} bursts …")
+
 # containers
 by_sir = [defaultdict(list) for _ in nets]
 by_sir_fft = defaultdict(list)
 
-# ────────────────────────── loop over dataset ──────────────────────────
-files = [p for fld in FOLDERS for p in (args.data/fld).glob("*.npz")]
 for f in tqdm(files, unit="file"):
     _, _, sir = parse_levels(f.parent.name)
     with np.load(f, allow_pickle=True) as z:
         x_raw = z["x"].astype(np.complex64)
-        meta   = z["meta"].item()
-        rms    = np.sqrt(np.mean(np.abs(x_raw)**2))
-        g_ref  = meta["pristine_gain"] / rms
+        meta_npz = z["meta"].item()
+        rms = np.sqrt(np.mean(np.abs(x_raw)**2))
+        g_ref = meta_npz["pristine_gain"] / rms
     ref_dBm = gain_to_dBm(g_ref)
 
     x_n = x_raw / rms
@@ -124,27 +132,20 @@ for f in tqdm(files, unit="file"):
                 p = (N-len(x_n))//2; burst = np.pad(x_n,(p,N-len(x_n)-p))
             else:
                 burst = x_n
-            # ---------- pack burst into tensor ----------
+            # pack to tensor
             if isinstance(net, torch.jit.ScriptModule):
-                # Sequence models (e.g. LSTM) expect (B, T, 2) — channels‑last
-                x_t = torch.tensor(
-                    np.stack([burst.real, burst.imag], -1),  # (N,2)
-                    dtype=torch.float32).unsqueeze(0).to(DEVICE)
+                x_t = torch.tensor(np.stack([burst.real, burst.imag], -1), dtype=torch.float32).unsqueeze(0).to(DEVICE)
             else:
-                # Scalar‑dB CNN expects (B, 2, N) — channels‑first
-                x_t = torch.tensor(
-                    np.stack([burst.real, burst.imag], 0),   # (2,N)
-                    dtype=torch.float32).unsqueeze(0).to(DEVICE)
-
-            # ---------- forward ----------
+                x_t = torch.tensor(np.stack([burst.real, burst.imag], 0), dtype=torch.float32).unsqueeze(0).to(DEVICE)
             out = net(x_t)
-            if isinstance(out, tuple): out = out[0]  # (decoded, scale)
-            if out.ndim == 3:  # sequence
+            if isinstance(out, tuple):
+                out = out[0]
+            if out.ndim == 3:
                 g_hat = seq_to_gain(out).cpu().item()
-                pred = gain_to_dBm(g_hat)
-            else:              # scalar dB
-                pred = out.cpu().item()
-            preds.append(pred)
+                pred_dBm = gain_to_dBm(g_hat)
+            else:
+                pred_dBm = out.cpu().item()
+            preds.append(pred_dBm)
 
     for m, p in enumerate(preds):
         by_sir[m][sir].append(p - ref_dBm)
@@ -152,20 +153,24 @@ for f in tqdm(files, unit="file"):
     fft_dBm = 10*math.log10((fft_3bin_amp(x_n)**2)/1e-3)
     by_sir_fft[sir].append(fft_dBm - ref_dBm)
 
-# ────────────────────────── plots ───────────────────────────────────────
+# ────────────────────────── plots & CSV ────────────────────────────────
+
 sirs = np.array(sorted(by_sir[0]))
-fig, ax = plt.subplots(figsize=(6.5,4))
-for m,(col,lbl) in enumerate(zip(colors,labels)):
+
+# 1) Mean signed error vs SIR
+fig, ax = plt.subplots(figsize=(6.5, 4))
+for m, (col, lbl) in enumerate(zip(colors, labels)):
     means = [np.mean(by_sir[m][s]) for s in sirs]
-    ax.plot(sirs,means,'o-',color=col,label=lbl)
-ax.plot(sirs,[np.mean(by_sir_fft[s]) for s in sirs],'^--',color='k',label='FFT 3‑bin')
+    ax.plot(sirs, means, 'o-', color=col, label=lbl)
+ax.plot(sirs, [np.mean(by_sir_fft[s]) for s in sirs], '^--', color='k', label='FFT 3-bin')
 ax.set_xlabel('SIR (dB)'); ax.set_ylabel('Mean ΔPower (dB)'); ax.grid(ls=':')
 ax.legend(frameon=False); fig.tight_layout()
-fig.savefig(args.outdir/'mean_dA_vs_SIR.png', dpi=220)
+fig.savefig(args.outdir / 'mean_dA_vs_SIR.png', dpi=220)
+plt.close(fig)
 
-# ───────────────── absolute‑error plot ────────────────────────────────
-fig_abs, ax_abs = plt.subplots(figsize=(6.5,4))
-for m,(col,lbl) in enumerate(zip(colors,labels)):
+# 2) Absolute error vs SIR
+fig_abs, ax_abs = plt.subplots(figsize=(6.5, 4))
+for m, (col, lbl) in enumerate(zip(colors, labels)):
     abs_means = [np.mean(np.abs(by_sir[m][s])) for s in sirs]
     ax_abs.plot(sirs, abs_means, 'o-', color=col, label=lbl)
 abs_fft = [np.mean(np.abs(by_sir_fft[s])) for s in sirs]
@@ -173,34 +178,26 @@ ax_abs.plot(sirs, abs_fft, '^--', color='k', label='FFT 3-bin')
 ax_abs.set_xlabel('SIR (dB)'); ax_abs.set_ylabel('Mean |ΔPower| (dB)')
 ax_abs.set_title('Absolute error versus SIR')
 ax_abs.grid(ls=':'); ax_abs.legend(frameon=False)
-fig_abs.tight_layout(); fig_abs.savefig(args.outdir/'abs_dA_vs_SIR.png', dpi=220)
+fig_abs.tight_layout(); fig_abs.savefig(args.outdir / 'abs_dA_vs_SIR.png', dpi=220)
+plt.close(fig_abs)
 
-# ────────────────────────── CSV ─────────────────────────────────────────
-with (args.outdir / 'summary.csv').open('w', newline='') as fh:
-    w = csv.writer(fh)
+# 3) CSV summary
+csv_path = args.outdir / 'summary.csv'
+with csv_path.open('w', newline='') as fh:
+    writer = csv.writer(fh)
     header = ['SIR']
     for lbl in labels:
         header += [f'µ_{lbl}', f'σ_{lbl}']
     header += ['µ_FFT', 'σ_FFT']
-    w.writerow(header)
+    writer.writerow(header)
 
     for s in sirs:
         row = [int(s)]
-        # per‑model statistics
         for m in range(len(nets)):
             arr = np.asarray(by_sir[m][s])
             row += [f"{arr.mean():.3f}", f"{arr.std():.3f}"]
-        # FFT baseline
         fft_arr = np.asarray(by_sir_fft[s])
         row += [f"{fft_arr.mean():.3f}", f"{fft_arr.std():.3f}"]
-        w.writerow(row)
+        writer.writerow(row)
 
-print("✓ Plots & CSV saved →", args.outdir.resolve())
-
-
-
-
-
-
-
-
+print(f"✓ Plots & CSV saved → {args.outdir.resolve()}")
