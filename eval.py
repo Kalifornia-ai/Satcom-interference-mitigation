@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
-"""evaluate_beacon_net.py  –  single‑pass evaluation of **BeaconPowerCNN**
-=======================================================================
-Compares the CNN’s CW‑power estimate against the pristine‑gain label and an
-FFT 3‑bin baseline across all SIR folders, produces plots + CSV just like the
-original hybrid script.
+"""evaluate_beacon_net_multi.py – compare ≥1 BeaconPowerCNN or TorchScript checkpoints
 
-* Only **power error (dB)** is analysed – no phase/Δf metrics.
-* Inputs are RMS‑normalised bursts (exactly as during training).
-* Baseline FFT works on the **same** pre‑processed burst for a fair test.
+Usage example
+-------------
+python evaluate_beacon_net_multi.py \
+       --data   ./dataset \
+       --ckpts  best_beacon_cnn.pt  DeploymentModel_len200_run1.pth \
+       --outdir eval_multi
 
-Usage
------
-$ python evaluate_beacon_net.py --data ./dataset \
-                               --ckpt best_beacon_cnn.pt \
-                               --outdir eval_figs_power
+* Any mix of **state‑dict checkpoints** and **TorchScript archives** is
+  accepted.  TorchScript models are detected automatically.
+* If a model expects a shorter input (e.g. 200 samples), the script takes the
+  **centre crop** of each 1 000‑sample burst to match its receptive field.
 """
 
 import argparse, csv, math, re
@@ -25,11 +23,10 @@ import torch
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.fft import fft
-from scipy.stats import wilcoxon
 
-from model import BeaconPowerCNN   # import your trained network
+from model import BeaconPowerCNN   # architecture for state‑dict checkpoints
 
-# ───────────────────────── configuration ────────────────────────────────
+# ────────────────────────── constants ────────────────────────────────────
 FOLDERS = [
     "Sine_50002-50dBm_QPSK_5G_-10dBm","Sine_50002-45dBm_QPSK_5G_-10dBm",
     "Sine_50002-40dBm_QPSK_5G_-10dBm","Sine_50002-45dBm_QPSK_5G_-20dBm",
@@ -40,85 +37,128 @@ FOLDERS = [
     "Sine_50002-10dBm_QPSK_5G_-30dBm","Sine_50002-25dBm_QPSK_5G_-50dBm",
     "Sine_50002-10dBm_QPSK_5G_-40dBm","Sine_50002-10dBm_QPSK_5G_-50dBm",
 ]
-PAT_CW, PAT_QPSK = re.compile(r"Sine_50002[-_]?(-?\d+)dBm"), re.compile(r"QPSK_5G[-_]?(-?\d+)dBm")
-GAIN = 0.375                                     # Hann coherent gain (3‑bin)
-
-# ───────────────────────── CLI ──────────────────────────────────────────
-ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-ap.add_argument("--data",   required=True, type=Path)
-ap.add_argument("--ckpt",   required=True, type=Path)
-ap.add_argument("--outdir", default="eval_figs_power", type=Path)
-ap.add_argument("--fs", type=float, default=10e6)
-args = ap.parse_args(); args.outdir.mkdir(parents=True, exist_ok=True)
-
-# ───────────────────────── model ────────────────────────────────────────
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-net = BeaconPowerCNN().to(DEVICE)
-net.load_state_dict(torch.load(args.ckpt, map_location=DEVICE))
-net.eval()
+PAT_CW   = re.compile(r"Sine_50002[-_]?(-?\d+)dBm")
+PAT_QPSK = re.compile(r"QPSK_5G[-_]?(-?\d+)dBm")
+GAIN = 0.375  # Hann 3‑bin coherent gain
 
 dBm_factor = 10.0 / math.log(10)
 
 def gain_to_dBm(g: complex) -> float:
     return dBm_factor * math.log((abs(g)**2) / 1e-3)
 
-# ───────────────────────── helpers ──────────────────────────────────────
-
 def fft_3bin_amp(x: np.ndarray) -> float:
     X = fft(x * np.hanning(len(x))) / len(x)
-    return np.sqrt(np.sum(np.abs(X[[0,1,-1]])**2) / GAIN)
+    return np.sqrt(np.sum(np.abs(X[[0, 1, -1]])**2) / GAIN)
 
-# folder → (CW,pwr_QPSK, SIR)
 parse_levels = lambda name: (
     int(PAT_CW.search(name).group(1)),
     int(PAT_QPSK.search(name).group(1)),
     -int(PAT_QPSK.search(name).group(1)) - int(PAT_CW.search(name).group(1))
 )
 
-# ───────────────────────── containers ───────────────────────────────────
-by_sir, by_sir_fft = defaultdict(list), defaultdict(list)
+# ────────────────────────── CLI ─────────────────────────────────────────
+cli = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+cli.add_argument("--data",   required=True, type=Path)
+cli.add_argument("--ckpts",  nargs="+",  required=True, type=Path,
+                help="state‑dict (.pt) or TorchScript (.pth) files")
+cli.add_argument("--outdir", default="eval_multi", type=Path)
+args = cli.parse_args(); args.outdir.mkdir(parents=True, exist_ok=True)
 
-# ───────────────────────── pass over dataset ────────────────────────────
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+cm     = plt.get_cmap("tab10")
+
+# ────────────────────────── model loader ────────────────────────────────
+nets, labels, colors, input_len = [], [], [], []
+for i, ck in enumerate(args.ckpts):
+    expected_len = 1000                # default (full burst)
+    try:
+        # -------- try as plain state‑dict (safe path) --------
+        sd = torch.load(ck, map_location=DEVICE, weights_only=True)
+        net = BeaconPowerCNN().to(DEVICE)
+        net.load_state_dict(sd)
+    except (TypeError, RuntimeError):   # -------- TorchScript fallback --------
+        net = torch.jit.load(ck, map_location=DEVICE)
+        # attempt to infer expected window length from first conv weight
+        param_list = list(net.parameters())
+        if param_list:                       # scripted module with params
+            k = param_list[0]
+            if k.dim() == 3:                 # (out,in,kernel)
+                expected_len = int(k.shape[-1])
+        # if no parameters, keep default 1000
+    net.eval()
+    nets.append(net)
+    labels.append(ck.stem)
+    colors.append(cm(i % 10))
+    input_len.append(expected_len)
+
+n_models = len(nets)
+
+# containers
+by_sir = [defaultdict(list) for _ in range(n_models)]
+by_sir_fft = defaultdict(list)
+
+# ────────────────────────── processing loop ────────────────────────────
 files = [p for fld in FOLDERS for p in (args.data/fld).glob("*.npz")]
 for f in tqdm(files, unit="file"):
     cw_dbm, _q_dbm, sir = parse_levels(f.parent.name)
     with np.load(f, allow_pickle=True) as z:
         x_raw = z["x"].astype(np.complex64)
-        g_ref = z["meta"].item()["pristine_gain"]
+        meta  = z["meta"].item()
+        rms   = np.sqrt(np.mean(np.abs(x_raw)**2))
+        g_ref = meta["pristine_gain"] / rms
     ref_dBm = gain_to_dBm(g_ref)
 
-    # --- pre‑process like training ------------------------------------
-    rms  = np.sqrt(np.mean(np.abs(x_raw)**2))
-    x_n  = x_raw / rms
-    x_t  = torch.tensor(np.stack([x_n.real, x_n.imag], 0)).unsqueeze(0).to(DEVICE)
+    x_n = x_raw / rms  # unit‑RMS
+
+    # predictions for every model ---------------------------------------
+    preds = []
     with torch.no_grad():
-        pred_dBm = net(x_t).item()
+        for m, net in enumerate(nets):
+            N = input_len[m]
+            if N < len(x_n):                      # centre crop if needed
+                start = (len(x_n) - N) // 2
+                burst = x_n[start:start+N]
+            elif N > len(x_n):                   # pad with zeros
+                pad = (N - len(x_n))//2
+                burst = np.pad(x_n, (pad, N-len(x_n)-pad))
+            else:
+                burst = x_n
+            x_t = torch.tensor(np.stack([burst.real, burst.imag], 0)).unsqueeze(0).to(DEVICE)
+            preds.append(net(x_t).item())
 
-    by_sir[sir].append(pred_dBm - ref_dBm)
-    by_sir_fft[sir].append(20*math.log10(fft_3bin_amp(x_n)/1e-3) - ref_dBm)
+    for m, pred in enumerate(preds):
+        by_sir[m][sir].append(pred - ref_dBm)
 
-# ───────────────────────── plotting & CSV (same as old) ────────────────
-sirs = np.array(sorted(by_sir))
-ml_means  = [np.mean(by_sir[s])     for s in sirs]
+    # FFT baseline (always 1000 samples)
+    fft_dBm = 10*math.log10((fft_3bin_amp(x_n)**2)/1e-3)
+    by_sir_fft[sir].append(fft_dBm - ref_dBm)
+
+# ────────────────────────── plots ───────────────────────────────────────
+sirs = np.array(sorted(by_sir[0]))
+fig, ax = plt.subplots(figsize=(6.5,4))
+for m in range(n_models):
+    means = [np.mean(by_sir[m][s]) for s in sirs]
+    ax.plot(sirs, means, 'o-', color=colors[m], label=labels[m])
 fft_means = [np.mean(by_sir_fft[s]) for s in sirs]
-
-# --- simple scatter plot -------------------------------------------------
-fig, ax = plt.subplots(figsize=(6,4))
-ax.plot(sirs, ml_means,  'o-', label='CNN')
-ax.plot(sirs, fft_means, '^--', label='FFT 3‑bin')
+ax.plot(sirs, fft_means, '^--', color='k', label='FFT 3‑bin')
 ax.set_xlabel('SIR (dB)'); ax.set_ylabel('Mean ΔPower (dB)'); ax.grid(ls=':')
-ax.legend(frameon=False)
-fig.tight_layout(); fig.savefig(args.outdir/'mean_dA_vs_SIR.png', dpi=220)
+ax.legend(frameon=False); fig.tight_layout()
+fig.savefig(args.outdir/'mean_dA_vs_SIR.png', dpi=220)
 
-# --- summary CSV & Wilcoxon ---------------------------------------------
-csv_path = args.outdir/'summary.csv'
-with open(csv_path, 'w', newline='') as fh:
+# ────────────────────────── CSV ─────────────────────────────────────────
+with (args.outdir/'summary.csv').open('w', newline='') as fh:
     w = csv.writer(fh)
-    w.writerow(['SIR','µ_CNN','σ_CNN','µ_FFT','σ_FFT','p_Wilcoxon'])
+    header = ['SIR']
+    for lbl in labels: header += [f'µ_{lbl}', f'σ_{lbl}']
+    header += ['µ_FFT', 'σ_FFT']; w.writerow(header)
     for s in sirs:
-        p = wilcoxon(by_sir_fft[s], by_sir[s]).pvalue
-        w.writerow([int(s),
-                    f"{np.mean(by_sir[s]):.3f}",  f"{np.std(by_sir[s]):.3f}",
-                    f"{np.mean(by_sir_fft[s]):.3f}", f"{np.std(by_sir_fft[s]):.3f}",
-                    f"{p:.2e}"])
-print('✓ Figures & summary.csv written to', args.outdir.resolve())
+        row = [int(s)]
+        for m in range(n_models):
+            arr = np.asarray(by_sir[m][s]); row += [f"{arr.mean():.3f}", f"{arr.std():.3f}"]
+        fft_arr = np.asarray(by_sir_fft[s]); row += [f"{fft_arr.mean():.3f}", f"{fft_arr.std():.3f}"]
+        w.writerow(row)
+
+print("✓ Plots & CSV saved ➜", args.outdir.resolve())
+
+
+
