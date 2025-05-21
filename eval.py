@@ -124,7 +124,19 @@ for f in tqdm(files, unit="file"):
                 p = (N-len(x_n))//2; burst = np.pad(x_n,(p,N-len(x_n)-p))
             else:
                 burst = x_n
-            x_t = torch.tensor(np.stack([burst.real, burst.imag],0)).unsqueeze(0).to(DEVICE)
+            # ---------- pack burst into tensor ----------
+            if isinstance(net, torch.jit.ScriptModule):
+                # Sequence models (e.g. LSTM) expect (B, T, 2) — channels‑last
+                x_t = torch.tensor(
+                    np.stack([burst.real, burst.imag], -1),  # (N,2)
+                    dtype=torch.float32).unsqueeze(0).to(DEVICE)
+            else:
+                # Scalar‑dB CNN expects (B, 2, N) — channels‑first
+                x_t = torch.tensor(
+                    np.stack([burst.real, burst.imag], 0),   # (2,N)
+                    dtype=torch.float32).unsqueeze(0).to(DEVICE)
+
+            # ---------- forward ----------
             out = net(x_t)
             if isinstance(out, tuple): out = out[0]  # (decoded, scale)
             if out.ndim == 3:  # sequence
@@ -172,6 +184,7 @@ with (args.outdir / 'summary.csv').open('w', newline='') as fh:
         w.writerow(row)
 
 print("✓ Plots & CSV saved →", args.outdir.resolve())
+
 
 
 
