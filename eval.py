@@ -161,7 +161,19 @@ for m,(col,lbl) in enumerate(zip(colors,labels)):
 ax.plot(sirs,[np.mean(by_sir_fft[s]) for s in sirs],'^--',color='k',label='FFT 3‑bin')
 ax.set_xlabel('SIR (dB)'); ax.set_ylabel('Mean ΔPower (dB)'); ax.grid(ls=':')
 ax.legend(frameon=False); fig.tight_layout()
-fig.savefig(args.outdir/'mean_dA_vs_SIR.png',dpi=220)
+fig.savefig(args.outdir/'mean_dA_vs_SIR.png', dpi=220)
+
+# ───────────────── absolute‑error plot ────────────────────────────────
+fig_abs, ax_abs = plt.subplots(figsize=(6.5,4))
+for m,(col,lbl) in enumerate(zip(colors,labels)):
+    abs_means = [np.mean(np.abs(by_sir[m][s])) for s in sirs]
+    ax_abs.plot(sirs, abs_means, 'o-', color=col, label=lbl)
+abs_fft = [np.mean(np.abs(by_sir_fft[s])) for s in sirs]
+ax_abs.plot(sirs, abs_fft, '^--', color='k', label='FFT 3-bin')
+ax_abs.set_xlabel('SIR (dB)'); ax_abs.set_ylabel('Mean |ΔPower| (dB)')
+ax_abs.set_title('Absolute error versus SIR')
+ax_abs.grid(ls=':'); ax_abs.legend(frameon=False)
+fig_abs.tight_layout(); fig_abs.savefig(args.outdir/'abs_dA_vs_SIR.png', dpi=220)
 
 # ────────────────────────── CSV ─────────────────────────────────────────
 with (args.outdir / 'summary.csv').open('w', newline='') as fh:
@@ -184,6 +196,7 @@ with (args.outdir / 'summary.csv').open('w', newline='') as fh:
         w.writerow(row)
 
 print("✓ Plots & CSV saved →", args.outdir.resolve())
+
 
 
 
