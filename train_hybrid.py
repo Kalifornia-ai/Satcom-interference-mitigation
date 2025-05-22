@@ -54,6 +54,7 @@ def run_epoch(model, loader, optim, train: bool, device):
     with torch.set_grad_enabled(train):
         for x, y in loader:                      # x:(B,N,2)  y:(B,2)
             x, y = x.to(device), y.to(device)
+            x = x.transpose(1, 2) 
             pred = model(x)["gain"]              # (B,2)
             loss = nn.functional.mse_loss(gain_to_dBm(pred), gain_to_dBm(y))
             if train:
