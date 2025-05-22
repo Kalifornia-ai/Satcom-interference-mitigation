@@ -1,162 +1,110 @@
 #!/usr/bin/env python3
-"""train_hybrid_beacon.py – Train the *HybridBeaconEstimator* (Res‑CNN + LSTM)
-against pristine complex‑gain labels.
-
-Uses the same dataset tree produced by *build_dataset_tree.py* and the same
-folder‑balanced 70 / 15 / 15 split logic as *cw_power_model.py*.
-
-Key options
------------
---limit-per-folder N   cap samples per folder (quick experiments)
---best-name NAME.pt    custom checkpoint filename  (default hybrid_best.pt)
---meta-name NAME.json  custom JSON metadata file   (default hybrid_meta.json)
---device cpu|cuda      run on CPU if CUDA not desired
+"""
+train_hybrid_beacon.py – train HybridBeaconEstimator to predict complex CW gain.
 
 Example
 -------
-```bash
-python train_hybrid_beacon.py ./dataset --epochs 60 --batch 64 --device cuda \
-       --best-name hybrid_lstm.pt --meta-name hybrid_meta.json
-```"""
-
+python train_hybrid_beacon.py ./dataset \
+        --epochs 60 --batch 128 --lr 3e-4 --device cuda \
+        --best-name hybrid_best.pt --meta hybrid_meta.json
+"""
 from pathlib import Path
-import math, argparse, random, json
-import numpy as np
+import math, json, argparse, random, numpy as np
 import torch, torch.nn as nn, torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader, Subset
 
-from dataset_loader import CWPowerDataset    # returns (2,N) real‑imag + pristine_gain
-from hybrid import HybridBeaconEstimator     # the model pasted earlier
+from data_loader import CWPowerDataset
+from hybrid_beacon_estimator import HybridBeaconEstimator   # <- put your model here
 
-###############################################################################
-# Helpers
-###############################################################################
+dBm_factor = 10.0 / math.log(10)
 
-def folder_balanced_split(files, seed=0, limit=0):
-    rng = np.random.default_rng(seed)
-    folders = np.array([f.parent.name for f in files])
-    idx_all = np.arange(len(files))
-    tr, va, te = [], [], []
-    for folder in np.unique(folders):
-        idx_f = idx_all[folders == folder]
-        rng.shuffle(idx_f)
-        if limit:
-            idx_f = idx_f[:limit]
-        n = len(idx_f)
-        n_tr = int(0.70 * n); n_va = int(0.15 * n)
-        tr.extend(idx_f[:n_tr])
-        va.extend(idx_f[n_tr:n_tr+n_va])
-        te.extend(idx_f[n_tr+n_va:])
-    return map(np.array, (tr, va, te))
+# ───────────────────────── helper ──────────────────────────
+def gain_to_dBm(g_reim: torch.Tensor) -> torch.Tensor:
+    """convert (B,2) real-imag gain → dBm scalar"""
+    p = g_reim.pow(2).sum(-1)           # |g|²  (linear W @ 1 Ω)
+    return dBm_factor * torch.log(p / 1e-3)
 
-###############################################################################
-# Loss & metric
-###############################################################################
-
-def mse_complex(pred, target):
-    """MSE over (Re,Im) pairs."""
-    return nn.functional.mse_loss(pred, target)
-
-###############################################################################
-# Training loops
-###############################################################################
-
-def train_epoch(model, loader, opt, device):
-    model.train(); total = 0.0
-    for x, y in loader:               # x (2,N) real‑imag, y (2,)
-        # reshape to (B,N,2)
-        x = x.to(device).permute(0, 2, 1)  # (B,2,N)->(B,N,2)
-        y = y.to(device)
-        opt.zero_grad()
-        pred_dict = model(x)
-        loss = mse_complex(pred_dict["gain"], y)
-        loss.backward(); opt.step()
-        total += loss.item() * x.size(0)
-    return total / len(loader.dataset)
-
-
-def eval_rmse(model, loader, device):
-    model.eval(); se, n = 0.0, 0
-    with torch.no_grad():
+# ───────────────────────── train / val ─────────────────────
+def run_epoch(model, loader, optim, device, train=True):
+    model.train() if train else model.eval()
+    running, n = 0.0, 0
+    with torch.set_grad_enabled(train):
         for x, y in loader:
-            x = x.to(device).permute(0, 2, 1)
-            y = y.to(device)
-            pred = model(x)["gain"]
-            se += (pred - y).pow(2).sum(dim=-1).sum().item(); n += x.size(0)
-    rmse = math.sqrt(se / n)
-    return rmse
+            x, y = x.to(device), y.to(device)      # x:(B,N,2)  y:(B,2)
+            pred = model(x)["gain"]                # (B,2)
+            loss = nn.functional.mse_loss(pred, y)
+            if train:
+                optim.zero_grad(); loss.backward(); optim.step()
+            running += loss.item() * x.size(0); n += x.size(0)
+    return running / n                             # mean MSE on I/Q
 
-###############################################################################
-# Main
-###############################################################################
-
+# ───────────────────────── main ────────────────────────────
 if __name__ == "__main__":
-    cudnn.benchmark = True
-
     ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("data_root", type=Path)
-    ap.add_argument("--epochs", type=int, default=50)
-    ap.add_argument("--batch",  type=int, default=128)
-    ap.add_argument("--lr",     type=float, default=3e-4)
+    ap.add_argument("--epochs", type=int, default=200)
+    ap.add_argument("--batch",  type=int, default=16)
+    ap.add_argument("--lr",     type=float, default=2e-4)
     ap.add_argument("--crop",   type=int, default=1000)
     ap.add_argument("--seed",   type=int, default=0)
-    ap.add_argument("--device", choices=["cuda","cpu"], default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--device", choices=["cuda","cpu"],
+                    default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--best-name", default="hybrid_best.pt")
-    ap.add_argument("--meta-name", default="hybrid_meta.json")
-    ap.add_argument("--limit-per-folder", type=int, default=0)
+    ap.add_argument("--meta",      default="hybrid_meta.json")
     args = ap.parse_args()
 
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
+    cudnn.benchmark = True
 
-    # Dataset setup --------------------------------------------------------
+    # dataset split taken from the original JSON -------------------------
     ds_full = CWPowerDataset(args.data_root, crop=args.crop)
-    tr_idx, va_idx, te_idx = folder_balanced_split(ds_full.files, seed=args.seed,
-                                                   limit=args.limit_per_folder)
-    ds_tr = Subset(ds_full, tr_idx)
-    ds_va = Subset(ds_full, va_idx)
-    ds_te = Subset(ds_full, te_idx)
+    meta_json = json.loads((args.data_root / "cw_power_train_meta.json").read_text())
+    train_idx = np.array(meta_json["train_idx"]); val_idx  = np.array(meta_json["val_idx"])
+    test_idx  = np.array(meta_json["test_idx"])
 
-    pin = args.device == "cuda"
-    dl_tr = DataLoader(ds_tr, batch_size=args.batch, shuffle=True, drop_last=True,
-                       num_workers=4, pin_memory=pin)
-    dl_va = DataLoader(ds_va, batch_size=args.batch*2, shuffle=False,
-                       num_workers=4, pin_memory=pin)
-    dl_te = DataLoader(ds_te, batch_size=args.batch*2, shuffle=False,
-                       num_workers=4, pin_memory=pin)
+    ds_train, ds_val, ds_test = (Subset(ds_full, idx) for idx in (train_idx,val_idx,test_idx))
+    pin = args.device=="cuda"
+    dl_train = DataLoader(ds_train, batch_size=args.batch, shuffle=True, drop_last=True,
+                          num_workers=4, pin_memory=pin)
+    dl_val   = DataLoader(ds_val,   batch_size=args.batch*4, shuffle=False,
+                          num_workers=4, pin_memory=pin)
+    dl_test  = DataLoader(ds_test,  batch_size=args.batch*4, shuffle=False,
+                          num_workers=4, pin_memory=pin)
 
-    print(f"train {len(ds_tr)}  val {len(ds_va)}  test {len(ds_te)}")
-
-    # Model & optimiser ----------------------------------------------------
+    # model / optimiser ---------------------------------------------------
     model = HybridBeaconEstimator().to(args.device)
-    opt   = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
-    best_rmse, best_ep = float('inf'), -1
-    ckpt_path = args.data_root / args.best_name
+    best_val, best_ep = float("inf"), -1
+    ckpt = args.data_root / args.best_name
+    train_curve, val_curve = [], []
 
+    # training loop -------------------------------------------------------
     for ep in range(1, args.epochs+1):
-        tr_loss = train_epoch(model, dl_tr, opt, args.device)
-        val_rmse = eval_rmse(model, dl_va, args.device)
-        print(f"[E{ep:02d}] train MSE {tr_loss:.4e} | val RMSE {val_rmse:.4f}")
-        if val_rmse < best_rmse:
-            best_rmse, best_ep = val_rmse, ep
-            torch.save(model.state_dict(), ckpt_path)
-            print(f"  ✓ saved new best @ epoch {ep}")
+        tr = run_epoch(model, dl_train, optim, args.device, train=True)
+        va = run_epoch(model, dl_val,   optim, args.device, train=False)
+        train_curve.append(tr); val_curve.append(va)
+        print(f"[E{ep:02d}] train MSE_IQ {tr:.4e} | val MSE_IQ {va:.4e}")
+        if va < best_val:
+            best_val, best_ep = va, ep
+            torch.save(model.state_dict(), ckpt)
+            print("   ✓ new best")
 
-    # Final test -----------------------------------------------------------
-    model.load_state_dict(torch.load(ckpt_path, map_location=args.device))
-    test_rmse = eval_rmse(model, dl_te, args.device)
-    print(f"best val RMSE {best_rmse:.4f}  (epoch {best_ep})")
-    print(f"test RMSE     {test_rmse:.4f}")
+    # test ---------------------------------------------------------------
+    model.load_state_dict(torch.load(ckpt, map_location=args.device))
+    test_mse = run_epoch(model, dl_test, optim, args.device, train=False)
+    print(f"best val MSE {best_val:.4e} (epoch {best_ep})")
+    print(f"test MSE     {test_mse:.4e}")
 
-    meta = dict(
-        seed=args.seed,
-        epochs=args.epochs,
-        best_val_rmse=best_rmse,
-        test_rmse=test_rmse,
-        best_epoch=best_ep,
-        limit_per_folder=args.limit_per_folder,
-        train_idx=tr_idx.tolist(),
-        val_idx=va_idx.tolist(),
-        test_idx=te_idx.tolist()
-    )
-    (args.data_root / args.meta_name).write_text(json.dumps(meta, indent=2))
+    # quick loss-curve figure -------------------------------------------
+    import matplotlib.pyplot as plt
+    e = np.arange(1, len(train_curve)+1)
+    plt.plot(e, train_curve, label="train"); plt.plot(e, val_curve, label="val")
+    plt.xlabel("epoch"); plt.ylabel("MSE on I/Q"); plt.legend(); plt.grid(ls=":")
+    plt.tight_layout(); plt.savefig(args.data_root/"hybrid_loss_curve.png", dpi=200)
+    plt.close()
+
+    # metadata -----------------------------------------------------------
+    meta = dict(seed=args.seed, best_val_mse=best_val, test_mse=test_mse,
+                best_epoch=best_ep, batch=args.batch, lr=args.lr)
+    (args.data_root/args.meta).write_text(json.dumps(meta, indent=2))
