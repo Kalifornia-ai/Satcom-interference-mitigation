@@ -60,6 +60,7 @@ def seq_to_gain(out_seq: torch.Tensor) -> torch.Tensor:
 # ────────────────────────── load models ────────────────────────────────
 # ───────── load models (CNN • Hybrid • LSTM • scripted) ───────────────
 nets, labels, colors, in_len = [], [], [], []
+expect_time_major = []    
 
 def identify_state_dict(sd):
     keys = list(sd)
@@ -75,11 +76,16 @@ for i, ck in enumerate(args.ckpts):
     try:                                            # try plain state-dict
         sd = torch.load(ck, map_location=DEVICE, weights_only=True)
         NetClass = identify_state_dict(sd)
+        if NetClass is LSTMSeperatorSingle:
+            expect_time_major.append(True)      # ← wants (B,N,2)
+        else:
+            expect_time_major.append(False)     # CNN & Hybrid
         net = NetClass().to(DEVICE)
         net.load_state_dict(sd)
         exp_len = 1000                              # all three take full burst
     except (RuntimeError, TypeError, FileNotFoundError):   # scripted
         net = torch.jit.load(ck, map_location=DEVICE)
+        expect_time_major.append(False)
         exp_len = 1000
         # crude receptive-field guess for very short scripted CNNs
         plist = list(net.parameters())
@@ -148,13 +154,15 @@ for f in tqdm(files, unit="file"):
                 p = (N-len(x_n))//2; burst = np.pad(x_n,(p,N-len(x_n)-p))
             else:
                 burst = x_n
-            if isinstance(net, torch.jit.ScriptModule):
-                x_t = torch.tensor(np.stack([burst.real, burst.imag], -1),
-                                   dtype=torch.float32).unsqueeze(0).to(DEVICE)
+            if expect_time_major[m]:
+                arr = np.stack([burst.real, burst.imag], -1)   # (N,2)
+                x_t = torch.tensor(arr, dtype=torch.float32).unsqueeze(0).to(DEVICE)
             else:
-                x_t = torch.tensor(np.stack([burst.real, burst.imag], 0),
-                                   dtype=torch.float32).unsqueeze(0).to(DEVICE)
+                arr = np.stack([burst.real, burst.imag], 0)    # (2,N)
+                x_t = torch.tensor(arr, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+
             out = net(x_t);  out = out[0] if isinstance(out, tuple) else out
+
             if isinstance(out, dict):                           # ← NEW
                 out = out["gain"]                               # take the 2-vector tensor
             if out.ndim == 3:                               # (B,T,2) sequence
