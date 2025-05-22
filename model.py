@@ -80,7 +80,7 @@ def freq_unshift_batch(x: torch.Tensor,
     device, dtype = x.device, x.dtype
 
     n = torch.arange(T, device=device, dtype=dtype)
-    phase = -2.0 * math.pi * f_shift * n / fs          # –2πft/fs  (rad)
+    phase = 2.0 * math.pi * f_shift * n / fs          # –2πft/fs  (rad)
     mixer = torch.exp(phase * (1j)).to(dtype=torch.complex64)  # [T] complex
 
     # reshape mixer to [1, T] then broadcast over batch
