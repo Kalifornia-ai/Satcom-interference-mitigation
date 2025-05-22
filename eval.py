@@ -69,6 +69,7 @@ def identify_state_dict(sd):
     if "res.0.c1.weight" in keys:                   # Hybrid
         return HybridBeaconEstimator
     if "lstm.0.weight_ih_l0" in keys:               # LSTM
+        expect_time_major.append(False)  
         return LSTMSeperatorSingle
     raise RuntimeError("Unknown state-dict format")
 
