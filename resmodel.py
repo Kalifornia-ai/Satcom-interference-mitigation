@@ -44,26 +44,24 @@ class HybridBeaconEstimator(nn.Module):
         # heads
         self.head_g  = nn.Linear(lstm_h, 2)
 
-    def forward(self, x):              # x (B,N,2)  real I/Q
-        B,N,_ = x.shape
-        x = x.transpose(1,2)           # (B,2,N)
-
-        # wide
+    def forward(self, x):            # x (B,2,N)  real I/Q
+    # wide path
         w = self.proj(x)
-        for blk in self.res: w = blk(w)
+        for blk in self.res:
+            w = blk(w)
 
-        # narrow
-        xc = torch.view_as_complex(x.transpose(1,2).contiguous())   # (B,N)
-        nb = self.n_proj(xc)
-        for blk in self.n_res: nb = blk(nb)
-        nb = F.interpolate(nb, size=w.shape[-1], mode='linear', align_corners=False)
+    # narrow path
+        nb = self.n_proj(x)
+        for blk in self.n_res:
+            nb = blk(nb)
+        nb = F.interpolate(nb, size=w.shape[-1],
+                       mode='linear', align_corners=False)
 
-        # concat & LSTM
-        feat = torch.cat([w, nb], 1).transpose(1,2)      # (B,N,C’)
-        out,_ = self.lstm(feat)
-        v = out.mean(1)                                  # (B,H)
-
-        return {"gain": self.head_g(v)}
+    # concat & LSTM
+        feat = torch.cat([w, nb], dim=1).transpose(1, 2)   # (B,N,C’)
+        out, _ = self.lstm(feat)
+        v = out.mean(1)
+        return {"gain": self.head_g(v)}                    # (B,2)
 
 ############################################################
 # Example usage
