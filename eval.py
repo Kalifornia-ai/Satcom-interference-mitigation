@@ -16,6 +16,8 @@ import torch, torch.nn.functional as F
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.fft import fft
+from resmodel import HybridBeaconEstimator
+from lstm import LSTMSeperatorSingle
 
 from model import BeaconPowerCNN   # scalar-dB reference architecture
 # ────────────────────────── CLI ─────────────────────────────────────────
