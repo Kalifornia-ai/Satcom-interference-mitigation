@@ -155,6 +155,8 @@ for f in tqdm(files, unit="file"):
                 x_t = torch.tensor(np.stack([burst.real, burst.imag], 0),
                                    dtype=torch.float32).unsqueeze(0).to(DEVICE)
             out = net(x_t);  out = out[0] if isinstance(out, tuple) else out
+            if isinstance(out, dict):                           # ← NEW
+                out = out["gain"]                               # take the 2-vector tensor
             if out.ndim == 3:                               # (B,T,2) sequence
                 g_hat = seq_to_gain(out).cpu().item()
                 pred  = gain_to_dBm(g_hat)
