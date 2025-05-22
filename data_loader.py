@@ -109,4 +109,5 @@ if __name__ == "__main__":
 
     ds = CWPowerDataset(args.root, crop=args.crop, undo_shift=args.undo_shift)
     x, y = ds[0]
+    print(np.shape(y))
     print("x", x.shape, x.dtype, "| target", y)

@@ -61,6 +61,35 @@ def gain_to_dBm(g_reim: torch.Tensor) -> torch.Tensor:
     return dBm_factor * torch.log(power_lin / 1e-3)
 
 
+def freq_unshift_batch(x: torch.Tensor,
+                       f_shift: float,
+                       fs: float) -> torch.Tensor:
+    """
+    Mix a batch of [B, 2, T] real-imag bursts by –f_shift Hz.
+
+    Parameters
+    ----------
+    x : Tensor
+        Shape [B, 2, T], dtype float32/float64.
+    f_shift : float
+        Frequency to remove (positive Hz).
+    fs : float
+        Sample-rate in Hz.
+    """
+    B, _, T = x.shape
+    device, dtype = x.device, x.dtype
+
+    n = torch.arange(T, device=device, dtype=dtype)
+    phase = -2.0 * math.pi * f_shift * n / fs          # –2πft/fs  (rad)
+    mixer = torch.exp(phase * (1j)).to(dtype=torch.complex64)  # [T] complex
+
+    # reshape mixer to [1, T] then broadcast over batch
+    x_c = torch.view_as_complex(x.permute(0, 2, 1).contiguous())  # [B, T]
+    x_c = x_c * mixer                                             # mix down
+    x_shifted = torch.view_as_real(x_c).permute(0, 2, 1)          # back to [B, 2, T]
+    return x_shifted
+
+
 def folder_balanced_split(files, seed=0, limit_per_folder=0):
     """Return 70/15/15 split indices with optional cap per folder."""
     rng = np.random.default_rng(seed)
@@ -85,10 +114,12 @@ def folder_balanced_split(files, seed=0, limit_per_folder=0):
 # Train / eval loops
 ###############################################################################
 
-def train_one_epoch(model, loader, optim, device):
+def train_one_epoch(model, loader, optim, device,   do_unshift: bool, fs: float):
     model.train(); total = 0.0
     for x, y in loader:
         x, y = x.to(device), y.to(device)
+        if do_unshift:
+            x = freq_unshift_batch(x, 2.0e5, fs)     # –200 kHz
         target = gain_to_dBm(y)
         optim.zero_grad()
         loss = nn.functional.mse_loss(model(x), target)
@@ -97,11 +128,13 @@ def train_one_epoch(model, loader, optim, device):
     return total / len(loader.dataset)
 
 
-def eval_rmse(model, loader, device):
+def eval_rmse(model, loader, device, do_unshift: bool, fs: float):
     model.eval(); se, n = 0.0, 0
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
+            if do_unshift:
+                x = freq_unshift_batch(x, 2.0e5, fs)
             target = gain_to_dBm(y)
             se += (model(x) - target).pow(2).sum().item(); n += x.size(0)
     return math.sqrt(se / n)
@@ -117,8 +150,14 @@ if __name__ == "__main__":
     ap.add_argument("data_root", type=Path)
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--batch",  type=int, default=256)
+    ap.add_argument("--unshift", action="store_true",
+                help="frequency-unshift each burst by –200 kHz before training")
     ap.add_argument("--lr",     type=float, default=3e-4)
     ap.add_argument("--crop",   type=int, default=1000)
+    ap.add_argument("--fs", type=float, default=10e6,
+                help="sample-rate of the raw I/Q (Hz) – needed for the mixer")
+    ap.add_argument("--jit-name", default="",
+               help="TorchScript filename to write (empty = don’t export)")
     ap.add_argument("--seed",   type=int, default=0)
     ap.add_argument("--device", choices=["cuda", "cpu"], default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--best-name", default="best_beacon_cnn.pt", help="checkpoint filename")
@@ -155,8 +194,8 @@ if __name__ == "__main__":
     ckpt_path = args.data_root / args.best_name
 
     for ep in range(1, args.epochs + 1):
-        tr_loss = train_one_epoch(model, dl_train, optim, args.device)
-        val_rmse = eval_rmse(model, dl_val, args.device)
+        tr_loss = train_one_epoch(model, dl_train, optim, args.device,  do_unshift=args.unshift, fs=args.fs)
+        val_rmse = eval_rmse(model, dl_val, args.device,  do_unshift=args.unshift, fs=args.fs)
         print(f"[E{ep:02d}] train MSE_dB² {tr_loss:.4e} | val RMSE_dB {val_rmse:.3f}")
         if val_rmse < best_rmse:
             best_rmse, best_ep = val_rmse, ep
@@ -165,7 +204,7 @@ if __name__ == "__main__":
 
     # Final test -----------------------------------------------------------
     model.load_state_dict(torch.load(ckpt_path, map_location=args.device))
-    test_rmse = eval_rmse(model, dl_test, args.device)
+    test_rmse = eval_rmse(model, dl_test, args.device,  do_unshift=args.unshift, fs=args.fs)
     print(f"best val RMSE {best_rmse:.3f} dB  (epoch {best_ep})")
     print(f"test RMSE     {test_rmse:.3f} dB")
 
@@ -183,6 +222,14 @@ if __name__ == "__main__":
         test_idx=test_idx.tolist(),
     )
     (args.data_root / args.meta_name).write_text(json.dumps(meta, indent=2))
+
+    # Optional TorchScript export -----------------------------------------
+    if args.jit_name:
+        script_path = args.data_root / args.jit_name
+        model_cpu = model.to("cpu").eval()
+        scripted  = torch.jit.script(model_cpu)        # robust to variable batch
+        scripted.save(script_path)
+        print(f"✓ TorchScript model written to {script_path}")
 
 
 
