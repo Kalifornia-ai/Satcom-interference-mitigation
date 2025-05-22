@@ -56,25 +56,40 @@ def seq_to_gain(out_seq: torch.Tensor) -> torch.Tensor:
     return torch.complex(re, im)
 
 # ────────────────────────── load models ────────────────────────────────
+# ───────── load models (CNN • Hybrid • LSTM • scripted) ───────────────
 nets, labels, colors, in_len = [], [], [], []
+
+def identify_state_dict(sd):
+    keys = list(sd)
+    if "front.0.weight" in keys:                    # CNN
+        return BeaconPowerCNN
+    if "res.0.c1.weight" in keys:                   # Hybrid
+        return HybridBeaconEstimator
+    if "lstm.0.weight_ih_l0" in keys:               # LSTM
+        return LSTMSeperatorSingle
+    raise RuntimeError("Unknown state-dict format")
+
 for i, ck in enumerate(args.ckpts):
-    expected = 1000
-    try:
+    try:                                            # try plain state-dict
         sd = torch.load(ck, map_location=DEVICE, weights_only=True)
-        net = BeaconPowerCNN().to(DEVICE)
+        NetClass = identify_state_dict(sd)
+        net = NetClass().to(DEVICE)
         net.load_state_dict(sd)
-    except (TypeError, RuntimeError):
+        exp_len = 1000                              # all three take full burst
+    except (RuntimeError, TypeError, FileNotFoundError):   # scripted
         net = torch.jit.load(ck, map_location=DEVICE)
+        exp_len = 1000
+        # crude receptive-field guess for very short scripted CNNs
         plist = list(net.parameters())
         if plist and plist[0].dim() == 3:
             k = plist[0].shape[-1]
-            if k >= 50:
-                expected = k
-    net.eval(); nets.append(net)
-    labels.append(ck.stem); colors.append(cm(i % 10)); in_len.append(expected)
+            if k >= 50: exp_len = k
+    net.eval()
+    nets.append(net)
+    labels.append(ck.stem)
+    colors.append(cm(i % 10))
+    in_len.append(exp_len)
 
-if args.len_override:
-    in_len = [args.len_override]*len(in_len)
 
 # ────────────────────────── build test file list via meta JSON ─────────
 meta_path = args.data / args.meta
@@ -138,10 +153,14 @@ for f in tqdm(files, unit="file"):
                 x_t = torch.tensor(np.stack([burst.real, burst.imag], 0),
                                    dtype=torch.float32).unsqueeze(0).to(DEVICE)
             out = net(x_t);  out = out[0] if isinstance(out, tuple) else out
-            if out.ndim == 3:     # sequence output
-                g_hat = seq_to_gain(out).cpu().item();  pred = gain_to_dBm(g_hat)
-            else:                 # scalar-dB output
-                pred = out.cpu().item()
+            if out.ndim == 3:                               # (B,T,2) sequence
+                g_hat = seq_to_gain(out).cpu().item()
+                pred  = gain_to_dBm(g_hat)
+            elif out.ndim == 2 and out.shape[-1] == 2:      # (B,2) re+im vector
+                g_hat = complex(out[0,0].item(), out[0,1].item())
+                pred  = gain_to_dBm(g_hat)
+            else:                                           # scalar-dB output
+                pred  = out.cpu().item()
             preds.append(pred)
 
     # ---------- PSD figures (once per SIR) ------------------------------
