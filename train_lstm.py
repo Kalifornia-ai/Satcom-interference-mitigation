@@ -19,7 +19,7 @@ import torch, torch.nn as nn, torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader, Subset
 
 from data_loader import CWPowerDataset
-from lstm_model import LSTMSeperatorSingle          # <- your class file
+from lstm import LSTMSeperatorSingle          # <- your class file
 
 dBm_factor = 10.0 / math.log(10)
 
