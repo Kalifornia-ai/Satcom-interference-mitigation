@@ -161,37 +161,63 @@ for f in tqdm(files, unit="file"):
                 pred_dBm = out.cpu().item()
             preds.append(pred_dBm)
     
-        # --------------------------------------------------------------
-    # --- one PSD figure per SIR (mixture · ground-truth · estimate)
-    # --------------------------------------------------------------
-    if sir not in plotted_sir:
-        #  a) mixture (already unit-RMS)
-        f_MHz, P_mix = db_spectrum(x_n)
+   # --------------------------------------------------------------
+# --- one PSD figure per SIR (mixture · ground-truth · estimate)
+# --------------------------------------------------------------
+if sir not in plotted_sir:
+    # (a) mixture (already unit-RMS)
+    f_MHz, P_mix = db_spectrum(x_n)
 
-        #  b) ground-truth CW only
-        y_gt = np.full_like(x_n, g_ref)          # constant CW
-        _,   P_gt  = db_spectrum(y_gt)
+    # (b) ground-truth CW only
+    y_gt = np.full_like(x_n, g_ref)
+    _, P_gt = db_spectrum(y_gt)
 
-        #  c) estimate from *first* model’s power prediction
-        pred_dBm   = preds[0]                    # first model only
-        mag_est    = math.sqrt(1e-3*10**(pred_dBm/10))
-        g_est      = mag_est * np.exp(1j*np.angle(g_ref))
-        y_hat      = np.full_like(x_n, g_est)
-        _,   P_hat = db_spectrum(y_hat)
+    # (c) estimate from *first* model’s prediction
+    pred_dBm = preds[0]
+    mag_est  = math.sqrt(1e-3 * 10**(pred_dBm / 10))
+    g_est    = mag_est * np.exp(1j * np.angle(g_ref))
+    y_hat_nn = np.full_like(x_n, g_est)
+    _, P_hat_nn = db_spectrum(y_hat_nn)
 
-        fig_psd, ax_psd = plt.subplots(figsize=(6,3))
-        ax_psd.plot(f_MHz, P_mix, label='mixture', lw=.7)
-        ax_psd.plot(f_MHz, P_gt,  label='ground truth')
-        ax_psd.plot(f_MHz, P_hat, label=f'estimate ({labels[0]})', ls='--')
-        ax_psd.set(xlabel='Frequency (MHz)', ylabel='dB re RMS',
-                   title=f'PSD – SIR {sir} dB',
-                   xlim=(-5, 5)); ax_psd.grid(ls=':')
-        ax_psd.set_ylim(-150, 0); ax_psd.legend(frameon=False, ncol=3)
-        fig_psd.tight_layout()
-        fig_psd.savefig(args.outdir / f'psd_SIR{sir}.png', dpi=220)
-        plt.close(fig_psd)
+    # (d) estimate from FFT 3-bin baseline
+    mag_fft  = fft_3bin_amp(x_n)          # linear volts
+    g_fft    = mag_fft * np.exp(1j * np.angle(g_ref))
+    y_hat_fft = np.full_like(x_n, g_fft)
+    _, P_hat_fft = db_spectrum(y_hat_fft)
 
-        plotted_sir.add(sir)
+    # ---------- full-band PSD --------------------------------------------
+    fig_psd, ax_psd = plt.subplots(figsize=(6, 3))
+    ax_psd.plot(f_MHz, P_mix,       lw=.7, label='mixture')
+    ax_psd.plot(f_MHz, P_gt,               label='ground truth')
+    ax_psd.plot(f_MHz, P_hat_nn,    ls='--', label=f'estimate ({labels[0]})')
+    ax_psd.plot(f_MHz, P_hat_fft,   ls=':',  label='FFT 3-bin')
+    ax_psd.set(xlabel='Frequency (MHz)', ylabel='dB re RMS',
+               title=f'PSD – SIR {sir} dB', xlim=(-5, 5))
+    ax_psd.set_ylim(-150, 0); ax_psd.grid(ls=':')
+    ax_psd.legend(frameon=False, ncol=4, fontsize=8)
+    fig_psd.tight_layout()
+    fig_psd.savefig(args.outdir / f'psd_SIR{sir}.png', dpi=220)
+    plt.close(fig_psd)
+
+    # ---------- zoomed PSD (±100 kHz) ------------------------------------
+    fig_zoom, ax_zoom = plt.subplots(figsize=(6, 3))
+    ax_zoom.plot(f_MHz, P_mix,       lw=.7)
+    ax_zoom.plot(f_MHz, P_gt)
+    ax_zoom.plot(f_MHz, P_hat_nn,    ls='--')
+    ax_zoom.plot(f_MHz, P_hat_fft,   ls=':')
+    ax_zoom.set(xlabel='Frequency (MHz)', ylabel='dB re RMS',
+                title=f'PSD zoom (±100 kHz) – SIR {sir} dB',
+                xlim=(-0.1, 0.1))                   # ±0.1 MHz = ±100 kHz
+    ax_zoom.set_ylim(-150, 0); ax_zoom.grid(ls=':')
+    ax_zoom.legend(['mixture', 'ground truth',
+                    f'estimate ({labels[0]})', 'FFT 3-bin'],
+                   frameon=False, ncol=4, fontsize=8)
+    fig_zoom.tight_layout()
+    fig_zoom.savefig(args.outdir / f'psd_zoom_SIR{sir}.png', dpi=220)
+    plt.close(fig_zoom)
+
+    plotted_sir.add(sir)
+
 
 
     for m, p in enumerate(preds):
