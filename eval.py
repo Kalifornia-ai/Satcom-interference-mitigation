@@ -57,6 +57,11 @@ cli.add_argument(
     default=None,
     help="force input length for all state‑dict nets (e.g. scripted tiny CNN)",
 )
+cli.add_argument(
+    "--with-fft",
+    action="store_true",
+    help="also evaluate / plot the 3-bin FFT baseline (default: off)",
+)
 args = cli.parse_args()
 args.outdir.mkdir(parents=True, exist_ok=True)
 
@@ -331,7 +336,8 @@ for cw in sorted(by_cw_qp[0]):
         err_arr = np.asarray(by_cw_qp_fft[cw][q])
         pct_fft_vals.append(pct_err(err_arr, ref_vec[:len(err_arr)]))
     offset = -0.4 + width/2 + n_nets*width
-    ax.bar(x_base + offset, pct_fft_vals, width, color='k',
+    if args.with_fft:
+        ax.bar(x_base + offset, pct_fft_vals, width, color='k',
            label='FFT 3-bin', alpha=0.8)
 
     # cosmetics --------------------------------------------------
