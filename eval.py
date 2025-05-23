@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.fft import fft
 from resmodel import HybridBeaconEstimator
-from lstm import LSTMSeperatorSingle
+from lstm import LSTMSeperatorSingle, LSTMSingleSource
 
 from model import BeaconPowerCNN   # scalar-dB reference architecture
 # ────────────────────────── CLI ─────────────────────────────────────────
@@ -35,7 +35,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 cm     = plt.get_cmap("tab10")
 
 dBm_factor = 10.0 / math.log(10)
-GAIN = 0.375
+GAIN = 0.375 #reduction of hanning model power application
 
 PAT_CW   = re.compile(r"Sine_50002[-_]?(-?\d+)dBm")
 PAT_QPSK = re.compile(r"QPSK_5G[-_]?(-?\d+)dBm")
@@ -71,14 +71,16 @@ def identify_state_dict(sd):
     if "lstm.0.weight_ih_l0" in keys:               # LSTM
         expect_time_major.append(False)  
         return LSTMSeperatorSingle
+    if "lstm_layers.0.weight_ih_l0" in keys:
+        return LSTMSingleSource
     raise RuntimeError("Unknown state-dict format")
 
 for i, ck in enumerate(args.ckpts):
     try:                                            # try plain state-dict
         sd = torch.load(ck, map_location=DEVICE, weights_only=True)
         NetClass = identify_state_dict(sd)
-        if NetClass is LSTMSeperatorSingle:
-            expect_time_major.append(True)      # ← wants (B,N,2)
+        if NetClass in [LSTMSeperatorSingle, LSTMSingleSource]:
+            expect_time_major.append(True)
         else:
             expect_time_major.append(False)     # CNN & Hybrid
         net = NetClass().to(DEVICE)
@@ -253,7 +255,7 @@ ax.legend(frameon=False); fig.tight_layout()
 fig.savefig(args.outdir/'abs_dA_vs_SIR.png',dpi=220); plt.close(fig)
 
 # 3) CSV summary
-with (args.outdir/'summary.csv').open('w',newline='') as fh:
+with (args.outdir/'summary.csv').open('w',newline='',encoding='utf-8') as fh:
     wr = csv.writer(fh)
     hdr = ['SIR']+[f'µ_{l}' for l in labels]+['µ_FFT'] \
                  +[f'σ_{l}' for l in labels]+['σ_FFT']
