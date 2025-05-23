@@ -181,7 +181,7 @@ for npz in tqdm(files, unit="file"):
 
     rms = np.sqrt(np.mean(np.abs(x_raw) ** 2))
     g_ref_lin = g_ref / rms  # normalised complex carrier
-    ref_dBm = gain_to_dBm(g_ref_lin)
+    ref_dBm = gain_to_dBm(g_ref)
     x_norm = x_raw / rms     # what every net was trained on
 
     preds: list[float] = []
@@ -207,12 +207,12 @@ for npz in tqdm(files, unit="file"):
                 out = out["gain"]
 
             if out.ndim == 3:  # (B,T,2)
-                pred = gain_to_dBm(seq_to_gain(out)[0].cpu().item())
+                pred = gain_to_dBm(seq_to_gain(out)[0].cpu().item()) *rms
             elif out.ndim == 2 and out.shape[-1] == 2:  # (B,2)
-                g_hat = complex(out[0, 0].item(), out[0, 1].item())
+                g_hat = complex(out[0, 0].item(), out[0, 1].item()) * rms
                 pred = gain_to_dBm(g_hat)
             else:  # scalar dBm
-                pred = out.cpu().item()
+                pred = out.cpu().item() * rms
             preds.append(pred)
 
     # bookkeeping --------------------------------------------------
@@ -223,7 +223,7 @@ for npz in tqdm(files, unit="file"):
         by_cw_qp[m][cw_dBm][qpsk_dBm].append(err)
     ref_global.append(ref_dBm)
 
-    err_fft = gain_to_dBm(fft_3bin_amp(x_norm) * np.exp(1j * np.angle(g_ref_lin))) - ref_dBm
+    err_fft = gain_to_dBm(fft_3bin_amp(x_raw) * np.exp(1j * np.angle(g_ref))) - ref_dBm
     by_sir_fft[sir].append(err_fft)
     by_cw_qp_fft[cw_dBm][qpsk_dBm].append(err_fft)
 
