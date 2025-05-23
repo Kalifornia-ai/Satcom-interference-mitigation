@@ -336,8 +336,8 @@ for cw in sorted(by_cw_qp[0]):
         err_arr = np.asarray(by_cw_qp_fft[cw][q])
         pct_fft_vals.append(pct_err(err_arr, ref_vec[:len(err_arr)]))
     offset = -0.4 + width/2 + n_nets*width
-    if args.with_fft:
-        ax.bar(x_base + offset, pct_fft_vals, width, color='k',
+ 
+    ax.bar(x_base + offset, pct_fft_vals, width, color='k',
            label='FFT 3-bin', alpha=0.8)
 
     # cosmetics --------------------------------------------------
