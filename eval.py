@@ -41,7 +41,7 @@ def gain_to_dBm(g: complex) -> float:
 def fft_3bin_amp(x: np.ndarray) -> float:
     """3‑bin FFT amplitude estimate (linear volts)."""
     X = fft(x * np.hanning(len(x))) / len(x)
-    return np.sqrt(np.abs(X[[0, 1, -1]])**2 .sum() / GAIN)
+    return np.sqrt((np.abs(X[[0, 1, -1]])**2) .sum() / GAIN)
 
 def seq_to_gain(y: torch.Tensor) -> torch.Tensor:
     """(B,T,2) → (B,) complex gain."""
