@@ -1,8 +1,8 @@
 {
   "seed": 1,
-  "best_val_mse": 0.2711086501181126,
-  "test_mse": 0.24809236307938895,
-  "best_epoch": 198,
+  "best_val_mse": 0.1663929617901643,
+  "test_mse": 0.18222280172941585,
+  "best_epoch": 182,
   "batch": 16,
   "lr": 0.0002,
   "limit_per_folder": 0,
