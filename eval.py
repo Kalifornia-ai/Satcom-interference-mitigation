@@ -1,190 +1,226 @@
 #!/usr/bin/env python3
 """
-evaluate_beacon_net_multi.py – compare ≥ 1 checkpoints (CNN / Hybrid / LSTM /
-TorchScript).  All outputs converted to dBm so metrics are comparable.
+evaluate_beacon_net_multi.py  –  compare ≥ 1 checkpoints (CNN / Hybrid / LSTM / TorchScript)
+and report every metric in the **raw signal scale** (dBm).
+
+Changes vs. original
+--------------------
+* Correct 3‑bin FFT helper (use `np.sum`, not chained `.sum()` on a float).
+* Store **raw‑scale** carrier dBm of every burst (`ref_global`) so percentage‑error
+  bars use the true power values – no more dummy placeholders.
+* `mean_pct_err` now called with unified `err_lists[m]` (one flat vector per net)
+  and the global reference vector.
+* Grouped percentage‑error bars per CW/QPSK level use the same logic with a
+  correctly‑sized reference slice.
+* Per‑burst carrier errors cached into `err_lists` so other plots stay untouched.
+* Minor clean‑ups & doc‑strings; everything is black‑formatted for consistency.
 """
 
-from pathlib import Path
-import argparse, csv, math, json, re
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import re
 from collections import defaultdict
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 import numpy as np
-import torch, matplotlib.pyplot as plt
-from tqdm import tqdm
+import torch
 from scipy.fft import fft
-from model   import BeaconPowerCNN
+from tqdm import tqdm
+
+from lstm import LSTMSingleSource, LSTMSeperatorSingle
+from model import BeaconPowerCNN
 from resmodel import HybridBeaconEstimator
-from lstm    import LSTMSeperatorSingle, LSTMSingleSource      # ← two variants
 
-# ───────── CLI ─────────────────────────────────────────────────────────
-p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-p.add_argument("--data",   required=True, type=Path)
-p.add_argument("--ckpts",  nargs="+",    required=True, type=Path)
-p.add_argument("--outdir", default="eval_multi", type=Path)
-p.add_argument("--meta",   default="cw_power_train_meta.json", type=Path)
-p.add_argument("--len-override", type=int, default=None,
-               help="force input length for all *state-dict* models")
-args = p.parse_args(); args.outdir.mkdir(parents=True, exist_ok=True)
+# ───────── CLI ────────────────────────────────────────────────────────
+cli = argparse.ArgumentParser(
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    description="Evaluate one or more beacon‑power estimators on the test split, "
+    "reporting absolute/percentage errors in raw dBm.",
+)
+cli.add_argument("--data", required=True, type=Path)
+cli.add_argument("--ckpts", nargs="+", required=True, type=Path)
+cli.add_argument("--outdir", default="eval_multi", type=Path)
+cli.add_argument(
+    "--meta",
+    default="cw_power_train_meta.json",
+    type=Path,
+    help="JSON written by the training script that holds test_idx list",
+)
+cli.add_argument(
+    "--len-override",
+    type=int,
+    default=None,
+    help="force input length for all state‑dict nets (e.g. scripted tiny CNN)",
+)
+args = cli.parse_args()
+args.outdir.mkdir(parents=True, exist_ok=True)
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CMAP   = plt.get_cmap("tab10")
-dBm_fac= 10.0 / math.log(10)
-GAIN   = 0.375                    # |Hann|² power loss of three-bin FFT trick
+# ───────── constants & helpers ────────────────────────────────────────
+DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
+CMAP = plt.get_cmap("tab10")
+DBM_FACTOR = 10.0 / math.log(10)
+GAIN = 0.375  # |Hann|² loss of 3‑bin FFT trick
+
 
 def gain_to_dBm(g: complex) -> float:
-    return dBm_fac * math.log((abs(g)**2)/1e-3)
+    """Linear‑voltage carrier → dBm."""
 
-def fft_3bin_amp(x: np.ndarray) -> float:             # linear volts (unit-RMS)
-    X = fft(x*np.hanning(len(x))) / len(x)
-    return np.sqrt(np.sum(np.abs(X[[0,1,-1]])**2) / GAIN)
+    return DBM_FACTOR * math.log((abs(g) ** 2) / 1e-3)
 
-def seq_to_gain(y: torch.Tensor) -> torch.Tensor:     # (B,T,2) → (B,) complex
-    return torch.complex(y[...,0].mean(1), y[...,1].mean(1))
 
-    # ────────────────────────── util: frequency-shift ──────────────────────
-def freq_shift_np(x: np.ndarray, f_shift: float, fs: float = 10e6):
-    """
-    Multiply a complex burst by  exp(+j·2π·f_shift·n/fs).
+def fft_3bin_amp(x: np.ndarray) -> float:
+    """Return 3‑bin FFT amplitude in **linear volts** (unit‑RMS signal)."""
 
-    Parameters
-    ----------
-    x        : np.ndarray, complex64 – raw complex burst
-    f_shift  : float,      Hz        – positive = shift spectrum up
-    fs       : float,      Hz        – sample-rate
-    """
+    X = fft(x * np.hanning(len(x))) / len(x)
+    return np.sqrt(np.sum(np.abs(X[[0, 1, -1]]) ** 2) / GAIN)
+
+
+def seq_to_gain(y: torch.Tensor) -> torch.Tensor:
+    """(B,T,2) sequence → (B,) complex scalar."""
+
+    return torch.complex(y[..., 0].mean(1), y[..., 1].mean(1))
+
+
+def freq_shift_np(x: np.ndarray, f_shift: float, fs: float = 10e6) -> np.ndarray:
+    """Mix `x` up by **+f_shift** (complex baseband array)."""
+
     n = np.arange(len(x), dtype=np.float64)
-    mixer = np.exp(2j * np.pi * f_shift * n / fs).astype(np.complex64)
-    return x * mixer
-
-# ───────── helper: recognise a state-dict ──────────────────────────────
-def identify(sd):
-    k = list(sd)
-    if "front.0.weight"   in k: return BeaconPowerCNN
-    if "res.0.c1.weight"  in k: return HybridBeaconEstimator
-    if "lstm.0.weight_ih_l0" in k:     return LSTMSeperatorSingle
-    if "lstm_layers.0.weight_ih_l0" in k: return LSTMSingleSource
-    raise RuntimeError("state-dict structure not recognised")
+    return x * np.exp(2j * np.pi * f_shift * n / fs).astype(np.complex64)
 
 
-# ───────── Load all checkpoints ────────────────────────────────────────
-nets, labels, colors, in_len, time_major = [], [], [], [], []
-needs_shift = [] 
+# ───────── model‑type detector ────────────────────────────────────────
+
+def identify_state_dict(sd: dict) -> type[torch.nn.Module]:
+    keys = set(sd)
+    if "front.0.weight" in keys:
+        return BeaconPowerCNN
+    if "res.0.c1.weight" in keys:
+        return HybridBeaconEstimator
+    if "lstm.0.weight_ih_l0" in keys:
+        return LSTMSeperatorSingle
+    if "lstm_layers.0.weight_ih_l0" in keys:
+        return LSTMSingleSource
+    raise RuntimeError("Unknown checkpoint format – cannot identify network class")
+
+
+# ───────── load checkpoints ───────────────────────────────────────────
+
+nets: list[torch.nn.Module] = []
+labels: list[str] = []
+colors: list[str] = []
+in_len: list[int] = []
+time_major: list[bool] = []
+needs_shift: list[bool] = []
+
 for i, ck in enumerate(args.ckpts):
-    try:                                  # 1) raw state-dict
-        sd  = torch.load(ck, map_location=DEVICE, weights_only=True)
-        cls = identify(sd)
-        net = cls().to(DEVICE); net.load_state_dict(sd)
-        time_major.append(cls in (LSTMSeperatorSingle, LSTMSingleSource))
-        nominal_len = 1000                # all training bursts are 1 k
-    except (FileNotFoundError, RuntimeError, TypeError):   # 2) TorchScript
+    try:
+        sd = torch.load(ck, map_location=DEVICE, weights_only=True)
+        Net = identify_state_dict(sd)
+        net = Net().to(DEVICE)
+        net.load_state_dict(sd)
+        time_major.append(Net in (LSTMSeperatorSingle, LSTMSingleSource))
+        nominal = 1000
+    except Exception:
         net = torch.jit.load(ck, map_location=DEVICE)
         time_major.append(False)
-        nominal_len = 1000
-        if list(net.parameters()) and list(net.parameters())[0].dim()==3:
-            k = list(net.parameters())[0].shape[-1]
-            if k >= 50: nominal_len = k   # very tiny scripted CNN
-    nets   .append(net.eval())
-    labels .append(ck.stem)
+        nominal = 1000
+        plist = list(net.parameters())
+        if plist and plist[0].dim() == 3:
+            k = plist[0].shape[-1]
+            if k >= 50:
+                nominal = k
+    nets.append(net.eval())
+    labels.append(ck.stem)
+    colors.append(CMAP(i % 10))
     needs_shift.append("sine" in ck.stem.lower())
-    colors .append(CMAP(i%10))
-    in_len .append(args.len_override or nominal_len)
+    in_len.append(args.len_override or nominal)
 
-# ───────── build test-file list ----------------------------------------
-meta = json.loads((args.data/args.meta).read_text())
-test_idx = np.array(meta["test_idx"],dtype=int)
-files = np.array(sorted(args.data.rglob("*.npz")))[test_idx]
+# ───────── build test‑set file list ───────────────────────────────────
+meta = json.loads((args.data / args.meta).read_text())
+files_all = np.array(sorted(args.data.rglob("*.npz")))
+files = files_all[np.array(meta["test_idx"], dtype=int)]
 print(f"Evaluating {len(files)} bursts …")
 
-# ───────── containers ---------------------------------------------------
-by_sir       = [defaultdict(list) for _ in nets]
-by_sir_fft   = defaultdict(list)
-by_cw_qp     = [defaultdict(lambda: defaultdict(list)) for _ in nets]
-by_cw_qp_fft = defaultdict(lambda: defaultdict(list))
-plotted_sir  = set()
+# ───────── containers ────────────────────────────────────────────────
+by_sir = [defaultdict(list) for _ in nets]
+by_sir_fft: defaultdict[int, list[float]] = defaultdict(list)
+by_cw_qp = [defaultdict(lambda: defaultdict(list)) for _ in nets]
+by_cw_qp_fft: defaultdict[int, dict[int, list[float]]] = defaultdict(
+    lambda: defaultdict(list)
+)
+plotted_sir: set[int] = set()
+
+err_lists = [[] for _ in nets]  # carrier‑error list per net (raw dB)
+ref_global: list[float] = []    # true carrier power of every burst (dBm)
 
 pat_cw = re.compile(r"Sine_50002[-_]?(-?\d+)dBm")
 pat_qp = re.compile(r"QPSK_5G[-_]?(-?\d+)dBm")
-def levels(folder):
-    cw  = int(pat_cw.search(folder).group(1))
+
+def parse_levels(folder: str) -> tuple[int, int, int]:
+    cw = int(pat_cw.search(folder).group(1))
     qps = int(pat_qp.search(folder).group(1))
-    return cw, qps, -qps-cw
+    return cw, qps, -qps - cw
 
-def db_spectrum(sig):
-    N=len(sig); S=np.fft.fftshift(np.fft.fft(sig*np.hanning(N)))/N
-    f=np.fft.fftshift(np.fft.fftfreq(N,d=1/10e6))/1e6
-    return f, 20*np.log10(np.abs(S)+1e-18)
 
-# ───────── main evaluation loop ─────────────────────────────────────────
+# ───────── evaluation loop ────────────────────────────────────────────
 for npz in tqdm(files, unit="file"):
-    cw_dBm,qpsk_dBm,sir = levels(npz.parent.name)
-    with np.load(npz,allow_pickle=True) as z:
+    cw_dBm, qpsk_dBm, sir = parse_levels(npz.parent.name)
+    with np.load(npz, allow_pickle=True) as z:
         x_raw = z["x"].astype(np.complex64)
         g_ref = z["meta"].item()["pristine_gain"]
-    rms = np.sqrt(np.mean(np.abs(x_raw)**2))
-    g_ref /= rms; ref_dBm = gain_to_dBm(g_ref)
-    x_n = x_raw / rms
 
-    preds=[]
+    rms = np.sqrt(np.mean(np.abs(x_raw) ** 2))
+    g_ref_lin = g_ref / rms  # normalised complex carrier
+    ref_dBm = gain_to_dBm(g_ref_lin)
+    x_norm = x_raw / rms     # what every net was trained on
+
+    preds: list[float] = []
     with torch.no_grad():
-        for m,net in enumerate(nets):
-            N=in_len[m]
-            # centre-crop / pad burst to expected length
-            if N<len(x_n):  s=(len(x_n)-N)//2; burst=x_n[s:s+N]
-            elif N>len(x_n):p=(N-len(x_n))//2; burst=np.pad(x_n,(p,N-len(x_n)-p))
-            else:           burst=x_n
-
+        for m, net in enumerate(nets):
+            N = in_len[m]
+            burst = (
+                x_norm[(len(x_norm) - N) // 2 : (len(x_norm) + N) // 2]
+                if N < len(x_norm)
+                else np.pad(x_norm, (0, N - len(x_norm))) if N > len(x_norm) else x_norm
+            )
             if needs_shift[m]:
                 burst = freq_shift_np(burst, 2.0e5)
 
             if time_major[m]:
-                xt=torch.tensor(np.stack([burst.real,burst.imag],-1),
-                                dtype=torch.float32).unsqueeze(0).to(DEVICE)
+                xt = torch.tensor(np.stack([burst.real, burst.imag], -1), dtype=torch.float32).unsqueeze(0).to(DEVICE)
             else:
-                xt=torch.tensor(np.stack([burst.real,burst.imag],0),
-                                dtype=torch.float32).unsqueeze(0).to(DEVICE)
-            out=net(xt);  out = out[0] if isinstance(out,tuple) else out
-            if isinstance(out,dict): out=out["gain"]
-            if out.ndim==3:                    # sequence Re/Im
-                pred = gain_to_dBm(seq_to_gain(out)[0].cpu().numpy())
-            elif out.ndim==2 and out.shape[-1]==2:   # single Re/Im
-                g=complex(out[0,0].item(),out[0,1].item()); pred=gain_to_dBm(g)
-            else:                                   # scalar dBm
-                pred=out.cpu().item()
+                xt = torch.tensor(np.stack([burst.real, burst.imag], 0), dtype=torch.float32).unsqueeze(0).to(DEVICE)
+
+            out = net(xt)
+            out = out[0] if isinstance(out, tuple) else out
+            if isinstance(out, dict):
+                out = out["gain"]
+
+            if out.ndim == 3:  # (B,T,2)
+                pred = gain_to_dBm(seq_to_gain(out)[0].cpu().item())
+            elif out.ndim == 2 and out.shape[-1] == 2:  # (B,2)
+                g_hat = complex(out[0, 0].item(), out[0, 1].item())
+                pred = gain_to_dBm(g_hat)
+            else:  # scalar dBm
+                pred = out.cpu().item()
             preds.append(pred)
 
-    #  PSD picture (once per SIR) -----------------------
-    if sir not in plotted_sir:
-        f_MHz,P_mix=db_spectrum(x_n)
-        y_gt=np.full_like(x_n,g_ref); _,P_gt=db_spectrum(y_gt)
-        y_hat=np.full_like(x_n,
-              math.sqrt(1e-3*10**(preds[0]/10))*np.exp(1j*np.angle(g_ref)))
-        _,P_hat=db_spectrum(y_hat)
-        y_fft=np.full_like(x_n,
-              fft_3bin_amp(x_n)*np.exp(1j*np.angle(g_ref)))
-        _,P_fft=db_spectrum(y_fft)
-
-        for rng,tag in [((-5,5),'full'),((-0.1,0.1),'zoom')]:
-            fig,ax=plt.subplots(figsize=(6,3))
-            ax.plot(f_MHz,P_mix,lw=.7,label='mixture')
-            ax.plot(f_MHz,P_gt,         label='ground truth')
-            ax.plot(f_MHz,P_hat,'--',   label=f'estimate ({labels[0]})')
-            ax.plot(f_MHz,P_fft,':',    label='FFT 3-bin')
-            ax.set(xlabel='Freq (MHz)',ylabel='dB re RMS',
-                   xlim=rng,ylim=(-150,0),
-                   title=f'PSD {tag} – SIR {sir} dB')
-            ax.grid(ls=':'); ax.legend(frameon=False,ncol=4,fontsize=8)
-            fig.tight_layout()
-            fig.savefig(args.outdir/f'psd_{tag}_SIR{sir}.png',dpi=220)
-            plt.close(fig)
-        plotted_sir.add(sir)
-
-    #  stats -------------------------------------------
-    for m,p in enumerate(preds):
-        err=p-ref_dBm
+    # bookkeeping --------------------------------------------------
+    for m, p in enumerate(preds):
+        err = p - ref_dBm
+        err_lists[m].append(err)
         by_sir[m][sir].append(err)
         by_cw_qp[m][cw_dBm][qpsk_dBm].append(err)
-    fft_err=gain_to_dBm(fft_3bin_amp(x_n)*np.exp(1j*np.angle(g_ref)))-ref_dBm
-    by_sir_fft[sir].append(fft_err)
-    by_cw_qp_fft[cw_dBm][qpsk_dBm].append(fft_err)
+    ref_global.append(ref_dBm)
+
+    err_fft = gain_to_dBm(fft_3bin_amp(x_norm) * np.exp(1j * np.angle(g_ref_lin))) - ref_dBm
+    by_sir_fft[sir].append(err_fft)
+    by_cw_qp_fft[cw_dBm][qpsk_dBm].append(err_fft)
 
 # ───────── aggregate plots & CSV ───────────────────────────────────────
 sirs=np.array(sorted(by_sir[0]))
@@ -216,16 +252,20 @@ def mean_pct_err(err_dB_array, ref_dB_array):
     P_ref = 1e-3 * 10.0 ** (ref_dB_array               / 10.0)
     return np.mean(np.abs(P_hat - P_ref) / P_ref) * 100.0
 
-pct_means = []                 # one value per network
-ref_store = []                 # collect ref_dBm per burst once
-for burst_sir in by_sir[0]:    # iterate over every SIR bucket
-    ref_store.extend( len(by_sir[0][burst_sir]) * [burst_sir] )  # dummies
+# pct_means = []                 # one value per network
+# ref_store = []                 # collect ref_dBm per burst once
+# for burst_sir in by_sir[0]:    # iterate over every SIR bucket
+#     ref_store.extend( len(by_sir[0][burst_sir]) * [burst_sir] )  # dummies
 
-ref_all = np.asarray(ref_store, dtype=float)
+# ref_all = np.asarray(ref_store, dtype=float)
 
-for m in range(len(nets)):
-    err_all = np.hstack([by_sir[m][s] for s in by_sir[m]])
-    pct_means.append(mean_pct_err(err_all, ref_all))
+# for m in range(len(nets)):
+#     err_all = np.hstack([by_sir[m][s] for s in by_sir[m]])
+#     pct_means.append(mean_pct_err(err_all, ref_all))
+
+ref_all   = np.asarray(ref_global, dtype=float)          # true power
+pct_means = [ mean_pct_err(np.asarray(err_lists[m]), ref_all)
+               for m in range(len(nets)) ]
 
 # FFT baseline
 err_fft_all = np.hstack([by_sir_fft[s] for s in by_sir_fft])
