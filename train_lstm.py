@@ -19,7 +19,7 @@ import torch, torch.nn as nn, torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader, Subset
 
 from data_loader import CWPowerDataset
-from lstm import LSTMSeperatorSingle          # <- your class file
+from lstm import LSTMSeperatorSingle, LSTMSingleSource          # <- your class file
 
 dBm_factor = 10.0 / math.log(10)
 
@@ -97,7 +97,7 @@ if __name__ == "__main__":
     print(f"train {len(ds_tr)}  val {len(ds_va)}  test {len(ds_te)}")
 
     # model / optimiser --------------------------------------------------
-    model = LSTMSeperatorSingle().to(args.device)
+    model = LSTMSingleSource().to(args.device)
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     best, best_ep = float("inf"), -1

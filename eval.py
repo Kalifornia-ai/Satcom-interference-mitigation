@@ -40,6 +40,21 @@ def fft_3bin_amp(x: np.ndarray) -> float:             # linear volts (unit-RMS)
 def seq_to_gain(y: torch.Tensor) -> torch.Tensor:     # (B,T,2) → (B,) complex
     return torch.complex(y[...,0].mean(1), y[...,1].mean(1))
 
+    # ────────────────────────── util: frequency-shift ──────────────────────
+def freq_shift_np(x: np.ndarray, f_shift: float, fs: float = 10e6):
+    """
+    Multiply a complex burst by  exp(+j·2π·f_shift·n/fs).
+
+    Parameters
+    ----------
+    x        : np.ndarray, complex64 – raw complex burst
+    f_shift  : float,      Hz        – positive = shift spectrum up
+    fs       : float,      Hz        – sample-rate
+    """
+    n = np.arange(len(x), dtype=np.float64)
+    mixer = np.exp(2j * np.pi * f_shift * n / fs).astype(np.complex64)
+    return x * mixer
+
 # ───────── helper: recognise a state-dict ──────────────────────────────
 def identify(sd):
     k = list(sd)
@@ -49,8 +64,10 @@ def identify(sd):
     if "lstm_layers.0.weight_ih_l0" in k: return LSTMSingleSource
     raise RuntimeError("state-dict structure not recognised")
 
+
 # ───────── Load all checkpoints ────────────────────────────────────────
 nets, labels, colors, in_len, time_major = [], [], [], [], []
+needs_shift = [] 
 for i, ck in enumerate(args.ckpts):
     try:                                  # 1) raw state-dict
         sd  = torch.load(ck, map_location=DEVICE, weights_only=True)
@@ -67,6 +84,7 @@ for i, ck in enumerate(args.ckpts):
             if k >= 50: nominal_len = k   # very tiny scripted CNN
     nets   .append(net.eval())
     labels .append(ck.stem)
+    needs_shift.append("sine" in ck.stem.lower())
     colors .append(CMAP(i%10))
     in_len .append(args.len_override or nominal_len)
 
@@ -113,6 +131,10 @@ for npz in tqdm(files, unit="file"):
             if N<len(x_n):  s=(len(x_n)-N)//2; burst=x_n[s:s+N]
             elif N>len(x_n):p=(N-len(x_n))//2; burst=np.pad(x_n,(p,N-len(x_n)-p))
             else:           burst=x_n
+
+            if needs_shift[m]:
+                burst = freq_shift_np(burst, 2.0e5)
+
             if time_major[m]:
                 xt=torch.tensor(np.stack([burst.real,burst.imag],-1),
                                 dtype=torch.float32).unsqueeze(0).to(DEVICE)
@@ -228,6 +250,64 @@ fig.savefig(args.outdir / 'pct_power_error_bar.png', dpi=220)
 plt.close(fig)
 
 print("✓ Bar-plot 'pct_power_error_bar.png' saved")
+
+
+# ───────── grouped percentage-error bars PER-CW-power ‐─────────
+for cw in sorted(by_cw_qp[0]):
+
+    qpsk_levels = sorted(by_cw_qp[0][cw])       # x-ticks
+    n_qp   = len(qpsk_levels)
+    n_nets = len(nets)
+    width  = 0.8 / (n_nets + 1)                 # +1 → FFT bar
+    x_base = np.arange(n_qp)                    # integer grid
+
+    # helper -----------------------------------------------------
+    def pct_err(err_list, ref_dBm):
+        P_hat = 1e-3 * 10.0 ** ((ref_dBm + err_list) / 10.0)
+        P_ref = 1e-3 * 10.0 ** (ref_dBm            / 10.0)
+        return np.mean(np.abs(P_hat - P_ref) / P_ref) * 100.0
+
+    # collect reference powers once (same for all nets / FFT)
+    ref_vec = []
+    for q in qpsk_levels:
+        ref_vec.extend(len(by_cw_qp[0][cw][q]) * [cw])   # CW level is reference
+    ref_vec = np.asarray(ref_vec, dtype=float)
+
+    # --------------- build the bars ----------------------------
+    fig, ax = plt.subplots(figsize=(8,4))
+
+    for m in range(n_nets):
+        pct_vals = []
+        for q in qpsk_levels:
+            err_arr = np.asarray(by_cw_qp[m][cw][q])
+            pct_vals.append(pct_err(err_arr, ref_vec[:len(err_arr)]))
+        offset = -0.4 + width/2 + m*width
+        ax.bar(x_base + offset, pct_vals, width, color=colors[m],
+               label=labels[m], alpha=0.8)
+
+    # FFT baseline
+    pct_fft_vals = []
+    for q in qpsk_levels:
+        err_arr = np.asarray(by_cw_qp_fft[cw][q])
+        pct_fft_vals.append(pct_err(err_arr, ref_vec[:len(err_arr)]))
+    offset = -0.4 + width/2 + n_nets*width
+    ax.bar(x_base + offset, pct_fft_vals, width, color='k',
+           label='FFT 3-bin', alpha=0.8)
+
+    # cosmetics --------------------------------------------------
+    ax.set_xticks(x_base)
+    ax.set_xticklabels([f"{q} dBm" for q in qpsk_levels])
+    ax.set_xlabel("QPSK power level")
+    ax.set_ylabel("Mean |ΔPower|  [%]")
+    ax.set_title(f"Percentage power error  (CW = {cw} dBm)")
+    ax.set_ylim(0, max(ax.get_ylim()[1], max(pct_fft_vals)*1.25))
+    ax.grid(ls=':', axis='y')
+    ax.legend(frameon=False, ncol=2)
+    fig.tight_layout()
+    fig.savefig(args.outdir / f"pct_power_error_bar_CW{cw}.png", dpi=220)
+    plt.close(fig)
+
+print("✓ Per-CW percentage-error bar plots written")
 
 
 # CSV
