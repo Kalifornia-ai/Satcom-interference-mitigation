@@ -22,7 +22,8 @@ The trained models predict the complex gain of the CW tone from raw, 1000-sample
 
   - `train_lstm.py`  
   Trains a compact  model (`LSTMSeperatorSingle`), ('LSTMSingleSource'), to estimate CW gain in dBm. Includes training, validation, test evaluation, and loss curves.
-
+  - 'train_causalLSTM.py'
+  Trains a compact CausalLSTM model of output dimension (B,1000,2) to estimate the real sinusoid waveform. Includes training, validation, test evaluation.
 - `resmodel.py` / `lstm_model.py`  
   Contains alternative models including HybridBeaconEstimator, LSTMSeperatorSingle, and LSTMSingleSource.
 
@@ -53,11 +54,11 @@ Output: 2-dim vector representing Re(g), Im(g)
 
 Other models include:
 
-HybridBeaconEstimator (ResNet + LSTM)
+HybridBeaconEstimator (ResNet + LSTM) - given name is DC-CRL
 
-LSTMSeperatorSingle (stacked BiLSTM + SE blocks)
+LSTMSeperatorSingle (stacked BiLSTM + SE blocks) - given name is Bi-LSTM
 
-LSTMSingleSource (SE + masking + output scaling
+LSTMSingleSource (SE + masking + output scaling - given name is CausalLSTM_SingleOutput
 
 
 ## Training
