@@ -7,6 +7,8 @@ The trained models predict the complex gain of the CW tone from raw, 1000-sample
 ---
 
 ## 🔍 Overview
+- 'generateSimulatedData.py'
+  Generates simulated data following a normal signal propagation path from generation to receiving and I/Q measurement
 
 - `createGain.py`  
   Builds a structured dataset of `.npz` bursts by combining mixture and clean-tone recordings. Computes complex gain from aligned CW bursts.
@@ -22,6 +24,7 @@ The trained models predict the complex gain of the CW tone from raw, 1000-sample
 
   - `train_lstm.py`  
   Trains a compact  model (`LSTMSeperatorSingle`), ('LSTMSingleSource'), to estimate CW gain in dBm. Includes training, validation, test evaluation, and loss curves.
+  
   - 'train_causalLSTM.py'
   Trains a compact CausalLSTM model of output dimension (B,1000,2) to estimate the real sinusoid waveform. Includes training, validation, test evaluation.
 - `resmodel.py` / `lstm_model.py`  
